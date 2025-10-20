@@ -1,1 +1,117 @@
-/data
+# -----------------------------
+# Airflow & Docker DataEng Project
+# -----------------------------
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.log
+*.sqlite3
+*.db
+.env
+.venv/
+venv/
+env/
+ENV/
+pip-wheel-metadata/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# VSCode / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS / System Files
+.DS_Store
+Thumbs.db
+
+# -----------------------------
+# Docker & Compose
+# -----------------------------
+# Compose internals
+docker-compose.override.yml
+.docker/
+
+# Volumes / Data directories
+data/
+logs/
+tmp/
+volumes/
+*/__pycache__/
+*/logs/
+*/tmp/
+
+# Airflow specific
+airflow.cfg
+webserver_config.py
+airflow.db
+airflow-webserver.pid
+dags/__pycache__/
+dags/.ipynb_checkpoints/
+dags/data/
+dags/logs/
+plugins/__pycache__/
+
+# SQLite / Metadata DB / Backup
+*.db
+*.bak
+*.backup
+
+# -----------------------------
+# Environment & Secrets
+# -----------------------------
+.env
+.env.*
+*.key
+*.pem
+*.crt
+*.csr
+*.secret
+*.token
+*.json
+
+# -----------------------------
+# Optional Project-Specific
+# -----------------------------
+# Local testing artifacts
+notebooks/
+test_output/
+__pycache__/
+*.cache
+.cache/
+*.tmp
+
+# Python virtual environments (local)
+*/.venv/
+*/env/
+*/.env/
+
+# -----------------------------
+# Node / Frontend (if Streamlit, Grafana plugins etc.)
+# -----------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+.next/
+out/
+
+# -----------------------------
+# Misc
+# -----------------------------
+*.tar.gz
+*.zip
+*.rar
+*.7z
