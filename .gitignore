@@ -85,7 +85,6 @@ plugins/__pycache__/
 # Optional Project-Specific
 # -----------------------------
 # Local testing artifacts
-notebooks/
 test_output/
 __pycache__/
 *.cache
