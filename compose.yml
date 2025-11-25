@@ -357,6 +357,19 @@ services:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
+  mongodb:
+    image: mongo:7.0
+    container_name: mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:-root}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:-example}
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-db-volume:/data/db
+    restart: always
+    networks:
+      - Practice
   pgadmin:
     container_name: pgadmin_airflow
     image: elestio/pgadmin
@@ -374,3 +387,4 @@ networks:
 
 volumes:
   postgres-db-volume:
+  mongo-db-volume:
