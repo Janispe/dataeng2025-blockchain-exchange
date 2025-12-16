@@ -417,6 +417,8 @@ services:
     environment:
       PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
       PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+      # Always (re-)import ./pgadmin/servers.json on container start
+      PGADMIN_REPLACE_SERVERS_ON_STARTUP: "True"
     volumes:
       - ./pgadmin/servers.json:/pgadmin4/servers.json:ro
     ports:
