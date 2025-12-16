@@ -49,7 +49,7 @@ def etherscan_blocks_to_mongo():
             "ETHERSCAN_MONGO_COLLECTION", default_var=DEFAULT_MONGO_COLLECTION
         )
         delete_after_load_raw = Variable.get(
-            "ETHERSCAN_DELETE_AFTER_LOAD", default_var="true"
+            "ETHERSCAN_DELETE_AFTER_LOAD", default_var="false"
         )
         delete_after_load = str(delete_after_load_raw).lower() in (
             "1",
