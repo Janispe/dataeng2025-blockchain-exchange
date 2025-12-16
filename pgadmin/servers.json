@@ -1,0 +1,22 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "Airflow Postgres (airflow DB)",
+      "Group": "Docker",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "airflow",
+      "Username": "airflow",
+      "SSLMode": "prefer"
+    },
+    "2": {
+      "Name": "Project Postgres (datadb / dw)",
+      "Group": "Docker",
+      "Host": "postgres_data",
+      "Port": 5432,
+      "MaintenanceDB": "datadb",
+      "Username": "datauser",
+      "SSLMode": "prefer"
+    }
+  }
+}

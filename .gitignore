@@ -79,7 +79,7 @@ plugins/__pycache__/
 *.csr
 *.secret
 *.token
-*.json
+
 
 # -----------------------------
 # Optional Project-Specific
