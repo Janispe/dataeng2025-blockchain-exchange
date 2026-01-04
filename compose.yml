@@ -329,6 +329,10 @@ services:
         echo
         /entrypoint airflow variables get ETHERSCAN_API_KEY >/dev/null 2>&1 || /entrypoint airflow variables set ETHERSCAN_API_KEY "***"
         echo "✓ Variable ETHERSCAN_API_KEY ready (replace *** with your API key in UI)"
+        /entrypoint airflow variables get ETHERSCAN_DELETE_AFTER_LOAD >/dev/null 2>&1 || /entrypoint airflow variables set ETHERSCAN_DELETE_AFTER_LOAD "false"
+        echo "✓ Variable ETHERSCAN_DELETE_AFTER_LOAD set to 'false'"
+        /entrypoint airflow variables get BINANCE_DELETE_AFTER_LOAD >/dev/null 2>&1 || /entrypoint airflow variables set BINANCE_DELETE_AFTER_LOAD "false"
+        echo "✓ Variable BINANCE_DELETE_AFTER_LOAD set to 'false'"
         echo
 
     # yamllint enable rule:line-length
