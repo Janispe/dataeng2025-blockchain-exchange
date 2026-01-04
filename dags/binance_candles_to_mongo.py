@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import csv
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -15,8 +15,8 @@ except ModuleNotFoundError:
 from airflow.exceptions import AirflowSkipException
 from airflow.models import Variable
 
-# Standardpfad im Airflow-Container (Mount von dags/data/binance)
-DEFAULT_DATA_ROOT = Path("/opt/airflow/dags/data/binance")
+# Standardpfad im Airflow-Container (Mount von dags/data/binance_klines)
+DEFAULT_DATA_ROOT = Path("/opt/airflow/dags/data/binance_klines")
 
 # Fallbacks für MongoDB – können per Airflow Variables überschrieben werden
 DEFAULT_MONGO_URI = "mongodb://root:example@mongodb:27017"
@@ -25,89 +25,59 @@ DEFAULT_MONGO_COLLECTION = "binance_candles"
 DEFAULT_BATCH_SIZE = 500
 
 
-def parse_filename(file_path: Path) -> Optional[Tuple[str, str, str]]:
+def parse_filename(file_path: Path) -> Optional[Tuple[str, str]]:
     """
-    Erwartet Schema SYMBOL-INTERVAL-YYYY-MM-DD.csv und gibt (symbol, interval, datum) zurück.
+    Erwartet Schema SYMBOL-INTERVAL.jsonl und gibt (symbol, interval) zurück.
     Gibt None zurück, falls das Schema nicht passt.
     """
     stem_parts = file_path.stem.split("-")
-    if len(stem_parts) < 3:
+    if len(stem_parts) < 2:
         return None
 
     symbol = stem_parts[0]
     interval = stem_parts[1]
-    trading_day = "-".join(stem_parts[2:])
     if not symbol or not interval:
         return None
-    return symbol, interval, trading_day
+    return symbol, interval
 
 
-def normalize_to_ms(epoch_value: int) -> int:
+def parse_json_line(line: str, source_file: str) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
     """
-    Konvertiert einen Zeitstempel (Sekunden/ms/mikrosekunden) heuristisch in Millisekunden.
+    Wandelt eine JSON-Zeile in ein Dokument + Upsert-Key um.
+    Gibt None zurück, wenn das JSON-Format nicht passt.
     """
-    if epoch_value >= 10**15:  # Mikrosekunden
-        return epoch_value // 1000
-    if epoch_value >= 10**12:  # Millisekunden
-        return epoch_value
-    if epoch_value >= 10**9:  # Sekunden
-        return epoch_value * 1000
-    return epoch_value
-
-
-def parse_row(
-    row: List[str], symbol: str, interval: str, trading_day: str, source_file: str, ingested_at: str
-) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
-    """
-    Wandelt eine CSV-Zeile in ein Dokument + Upsert-Key um.
-    Gibt None zurück, wenn das Zeilenformat nicht passt.
-    """
-    if len(row) < 11:
-        return None
-
     try:
-        open_time_raw = int(float(row[0]))
-        close_time_raw = int(float(row[6]))
-        open_time_ms = normalize_to_ms(open_time_raw)
-        close_time_ms = normalize_to_ms(close_time_raw)
-        open_time_iso = pendulum.from_timestamp(open_time_ms / 1000, tz="UTC").to_iso8601_string()
-        close_time_iso = pendulum.from_timestamp(close_time_ms / 1000, tz="UTC").to_iso8601_string()
-        doc = {
-            "symbol": symbol,
-            "interval": interval,
-            "trading_day": trading_day,
-            "open_time_ms": open_time_ms,
-            "open_time_raw": open_time_raw,
-            "open_time_iso": open_time_iso,
-            "close_time_ms": close_time_ms,
-            "close_time_raw": close_time_raw,
-            "close_time_iso": close_time_iso,
-            "open": float(row[1]),
-            "high": float(row[2]),
-            "low": float(row[3]),
-            "close": float(row[4]),
-            "volume": float(row[5]),
-            "quote_asset_volume": float(row[7]),
-            "number_of_trades": int(float(row[8])),
-            "taker_buy_base_volume": float(row[9]),
-            "taker_buy_quote_volume": float(row[10]),
-            "source_file": source_file,
-            "ingested_at": ingested_at,
-        }
-    except (ValueError, TypeError, IndexError):
-        return None
+        doc = json.loads(line.strip())
+        if not isinstance(doc, dict):
+            return None
 
-    key = {"symbol": symbol, "interval": interval, "open_time_ms": open_time_ms}
-    return doc, key
+        # Validiere erforderliche Felder
+        required_fields = ["symbol", "interval", "open_time_ms"]
+        if not all(field in doc for field in required_fields):
+            return None
+
+        # Füge source_file hinzu (überschreibe ingested_at nicht, da es vom API-DAG kommt)
+        doc["source_file"] = source_file
+
+        # Erstelle Upsert-Key
+        key = {
+            "symbol": doc["symbol"],
+            "interval": doc["interval"],
+            "open_time_ms": doc["open_time_ms"]
+        }
+
+        return doc, key
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
 
 
 @dag(
     start_date=pendulum.datetime(2025, 11, 24, tz="Europe/Paris"),
     schedule="@daily",
     catchup=False,
-    tags=["binance", "candles", "mongodb", "load"],
+    tags=["binance", "klines", "mongodb", "load"],
     default_args=dict(retries=2, retry_delay=pendulum.duration(minutes=2)),
-    description="Lädt Candle-Sticks aus dags/data/binance nach MongoDB (einmal pro Tag).",
+    description="Lädt Kline-Daten aus dags/data/binance_klines nach MongoDB (JSONL-Format).",
 )
 def binance_candles_to_mongo():
     @task
@@ -140,9 +110,10 @@ def binance_candles_to_mongo():
         if not data_root.exists():
             raise AirflowSkipException(f"Binance-Datenpfad existiert nicht: {data_root}")
 
-        files = sorted(p for p in data_root.glob("*.csv") if p.is_file())
+        # Suche rekursiv nach JSONL-Dateien (auch in Unterordnern mit Datum)
+        files = sorted(p for p in data_root.rglob("*.jsonl") if p.is_file())
         if not files:
-            raise AirflowSkipException(f"Keine CSV-Dateien unter {data_root} gefunden.")
+            raise AirflowSkipException(f"Keine JSONL-Dateien unter {data_root} gefunden.")
         return [str(p) for p in files]
 
     @task
@@ -162,25 +133,28 @@ def binance_candles_to_mongo():
         }
 
         batch: List[UpdateOne] = []
-        ingest_ts = pendulum.now("UTC").to_iso8601_string()
 
         for file_str in files:
             path = Path(file_str)
             parsed = parse_filename(path)
             if parsed is None:
-                stats["rows_skipped"] += 1
+                print(f"Überspringe Datei mit ungültigem Namen: {path.name}")
                 continue
 
-            symbol, interval, trading_day = parsed
+            symbol, interval = parsed
             try:
-                with path.open("r", encoding="utf-8", newline="") as f:
-                    reader = csv.reader(f)
-                    for row in reader:
-                        parsed_row = parse_row(row, symbol, interval, trading_day, path.name, ingest_ts)
-                        if parsed_row is None:
+                with path.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+
+                        parsed_line = parse_json_line(line, path.name)
+                        if parsed_line is None:
                             stats["rows_skipped"] += 1
                             continue
-                        doc, key = parsed_row
+
+                        doc, key = parsed_line
                         batch.append(UpdateOne(key, {"$set": doc}, upsert=True))
                         stats["rows_total"] += 1
 
@@ -191,8 +165,13 @@ def binance_candles_to_mongo():
                             stats["matched"] += result.matched_count
                             batch.clear()
             except FileNotFoundError:
+                print(f"Datei nicht gefunden: {path}")
+                continue
+            except Exception as exc:
+                print(f"Fehler beim Verarbeiten von {path}: {exc}")
                 continue
 
+            # Schreibe verbleibende Batch-Daten nach jeder Datei
             if batch:
                 result = collection.bulk_write(batch, ordered=False)
                 stats["upserted"] += result.upserted_count
@@ -205,11 +184,14 @@ def binance_candles_to_mongo():
             if settings.get("delete_after_load"):
                 try:
                     path.unlink(missing_ok=True)
+                    print(f"Datei gelöscht: {path}")
                 except Exception as exc:
                     print(f"Warnung: Konnte Datei nicht löschen {path}: {exc}")
 
-        if stats["rows_total"] == 0 and stats["upserted"] == 0 and stats["modified"] == 0:
-            raise AirflowSkipException("Keine gültigen Candle-Daten gefunden.")
+        client.close()
+
+        if stats["rows_total"] == 0:
+            raise AirflowSkipException("Keine gültigen Kline-Daten gefunden.")
 
         return stats
 
