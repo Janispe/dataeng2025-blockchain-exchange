@@ -21,7 +21,7 @@ ETH_CHAIN_ID = "1"  # Ethereum Mainnet
 # Free-Tier Limit ~5 req/s -> wir bleiben konservativ bei 3-4 req/s
 REQ_PAUSE_SEC = 0.3
 # Fallback: Wieviele neueste Blöcke beim allerersten Lauf holen?
-FALLBACK_LAST_N_BLOCKS = 100
+FALLBACK_LAST_N_BLOCKS = 1000
 
 # Zielpfad relativ zum Container
 def out_path(execution_date_str: str) -> Path:
@@ -30,8 +30,10 @@ def out_path(execution_date_str: str) -> Path:
 
 @dag(
     start_date=pendulum.datetime(2025, 10, 1, tz="Europe/Paris"),
-    schedule="0 * * * *",  # stündlich
+    schedule="* * * * *",  # minütlich
     catchup=False,
+    max_active_runs=1,
+    is_paused_upon_creation=True,
     tags=["ethereum", "etherscan", "ingestion"],
     default_args=dict(retries=2, retry_delay=pendulum.duration(minutes=2)),
     description="Sammelt inkrementell die neuesten Ethereum-Blöcke von Etherscan und speichert sie als JSONL.",
@@ -123,6 +125,10 @@ def etherscan_latest_blocks():
                 if block_obj is None:
                     # z.B. Reorg / noch nicht verfügbar – wir loggen und überspringen
                     # (Alternativ: retry-Mechanik einbauen)
+                    continue
+                if not isinstance(block_obj, dict):
+                    # Unerwartetes Format, z.B. Rate-Limit-Hinweis
+                    print(f"Skip block {number} with unexpected result: {block_obj!r}")
                     continue
 
                 # eine Zeile pro Block
