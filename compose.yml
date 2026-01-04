@@ -324,6 +324,12 @@ services:
         echo "Files in shared volumes:"
         echo
         ls -la /opt/airflow/{logs,dags,plugins,config,data}
+        echo
+        echo "Setting up Airflow Variables..."
+        echo
+        /entrypoint airflow variables get ETHERSCAN_API_KEY >/dev/null 2>&1 || /entrypoint airflow variables set ETHERSCAN_API_KEY "***"
+        echo "✓ Variable ETHERSCAN_API_KEY ready (replace *** with your API key in UI)"
+        echo
 
     # yamllint enable rule:line-length
     environment:
