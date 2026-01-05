@@ -44,7 +44,6 @@ docker-compose.override.yml
 .docker/
 
 # Volumes / Data directories
-data/
 logs/
 tmp/
 volumes/
@@ -59,17 +58,6 @@ airflow.db
 airflow-webserver.pid
 dags/__pycache__/
 dags/.ipynb_checkpoints/
-!dags/data/
-dags/data/*
-# allow committing this specific file under dags/data/
-!dags/data/binance_klines/
-dags/data/binance_klines/*
-!dags/data/binance_klines/2026-01-04/
-!dags/data/binance_klines/2026-01-04/ETHUSDT-1m.jsonl
-!dags/data/ethereum_blocks/
-dags/data/ethereum_blocks/*
-!dags/data/ethereum_blocks/2026-01-04/
-!dags/data/ethereum_blocks/2026-01-04/blocks.jsonl
 dags/logs/
 plugins/__pycache__/
 
