@@ -143,6 +143,116 @@ def fetch_historical_trends(
     return df
 
 
+@st.cache_data(ttl=300)
+def fetch_cmc_latest_snapshot_ts(
+    start_date: str,
+    end_date: str,
+    _conn: Optional[Any] = None,
+) -> Optional[pd.Timestamp]:
+    """Fetch latest CoinMarketCap snapshot timestamp in (optional) date window."""
+    if _conn is None:
+        _conn = get_db_connection()
+
+    query = """
+        SELECT MAX(snapshot_ts) AS snapshot_ts
+        FROM dw.analysis_coinmarketcap_top_assets
+        WHERE snapshot_ts >= %(start_date)s
+          AND snapshot_ts < %(end_date)s
+    """
+
+    df = pd.read_sql(
+        query,
+        _conn,
+        params={"start_date": start_date, "end_date": end_date},
+    )
+    snapshot_ts = df.iloc[0]["snapshot_ts"] if not df.empty else None
+    if snapshot_ts is not None and not pd.isna(snapshot_ts):
+        return pd.to_datetime(snapshot_ts)
+
+    # Fallback: latest snapshot overall.
+    df = pd.read_sql(
+        "SELECT MAX(snapshot_ts) AS snapshot_ts FROM dw.analysis_coinmarketcap_top_assets",
+        _conn,
+    )
+    snapshot_ts = df.iloc[0]["snapshot_ts"] if not df.empty else None
+    if snapshot_ts is None or pd.isna(snapshot_ts):
+        return None
+    return pd.to_datetime(snapshot_ts)
+
+
+@st.cache_data(ttl=300)
+def fetch_cmc_top_assets_for_snapshot(
+    snapshot_ts: Any,
+    _conn: Optional[Any] = None,
+) -> pd.DataFrame:
+    """Fetch CoinMarketCap top assets for a given snapshot."""
+    if _conn is None:
+        _conn = get_db_connection()
+
+    query = """
+        SELECT
+            snapshot_ts,
+            rank,
+            symbol,
+            name,
+            price_usd,
+            volume_24h,
+            market_cap,
+            percent_change_24h,
+            computed_at
+        FROM dw.analysis_coinmarketcap_top_assets
+        WHERE snapshot_ts = %(snapshot_ts)s
+        ORDER BY rank
+    """
+
+    df = pd.read_sql(
+        query,
+        _conn,
+        params={"snapshot_ts": snapshot_ts},
+    )
+    if not df.empty:
+        df["snapshot_ts"] = pd.to_datetime(df["snapshot_ts"])
+        df["computed_at"] = pd.to_datetime(df["computed_at"])
+    return df
+
+
+@st.cache_data(ttl=300)
+def fetch_integrated_daily_data(
+    start_date: str,
+    end_date: str,
+    _conn: Optional[Any] = None,
+) -> pd.DataFrame:
+    """Fetch integrated daily analysis (CMC vs Binance vs Ethereum) in a date window."""
+    if _conn is None:
+        _conn = get_db_connection()
+
+    query = """
+        SELECT
+            trading_date,
+            base_symbol,
+            cmc_price_usd,
+            cmc_market_cap,
+            binance_avg_close_usdt,
+            binance_avg_volume_usdt,
+            eth_avg_base_fee_gwei,
+            computed_at
+        FROM dw.analysis_integrated_daily
+        WHERE trading_date >= %(start_date)s
+          AND trading_date < %(end_date)s
+        ORDER BY trading_date
+    """
+
+    df = pd.read_sql(
+        query,
+        _conn,
+        params={"start_date": start_date, "end_date": end_date},
+    )
+    if not df.empty:
+        df["trading_date"] = pd.to_datetime(df["trading_date"])
+        df["computed_at"] = pd.to_datetime(df["computed_at"])
+    return df
+
+
 def create_dual_axis_chart(
     df: pd.DataFrame,
     y1_col: str,

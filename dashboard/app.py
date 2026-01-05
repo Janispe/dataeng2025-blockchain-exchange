@@ -78,7 +78,7 @@ def main():
         st.warning("No data available for the selected date range. Please adjust the filters or ensure the analysis DAG has run.")
         st.stop()
 
-    tabs = st.tabs(["📈 Overview", "⏱️ Time Series", "🔗 Correlation", "📊 Historical Trends", "📋 Raw Data"])
+    tabs = st.tabs(["📈 Overview", "⏱️ Time Series", "🔗 Correlation", "🪙 CoinMarketCap", "📊 Historical Trends", "📋 Raw Data"])
 
     with tabs[0]:
         st.header("Overview & Key Metrics")
@@ -249,6 +249,173 @@ def main():
             st.dataframe(stats_df, use_container_width=True)
 
     with tabs[3]:
+        st.header("CoinMarketCap Analysis")
+        st.markdown("Shows CoinMarketCap-derived analytics from the data warehouse (if available).")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.subheader("Top Assets Snapshot")
+            with st.spinner("Loading CoinMarketCap snapshot..."):
+                try:
+                    snapshot_ts = utils.fetch_cmc_latest_snapshot_ts(
+                        start_date=str(start_date),
+                        end_date=str(end_date),
+                        _conn=conn,
+                    )
+                    if snapshot_ts is None:
+                        cmc_top_df = pd.DataFrame()
+                    else:
+                        cmc_top_df = utils.fetch_cmc_top_assets_for_snapshot(
+                            snapshot_ts=snapshot_ts,
+                            _conn=conn,
+                        )
+                except Exception as e:
+                    snapshot_ts = None
+                    cmc_top_df = pd.DataFrame()
+                    st.error(f"Error loading CoinMarketCap snapshot: {e}")
+
+            if cmc_top_df.empty:
+                st.info("No CoinMarketCap snapshot found. Run `pipeline_4_analytics` (CoinMarketCap section) to populate `dw.analysis_coinmarketcap_top_assets`.")
+            else:
+                st.caption(f"Snapshot: {pd.to_datetime(snapshot_ts).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+
+                display_df = cmc_top_df[[
+                    "rank",
+                    "symbol",
+                    "name",
+                    "price_usd",
+                    "market_cap",
+                    "volume_24h",
+                    "percent_change_24h",
+                ]].copy()
+                display_df.columns = [
+                    "Rank",
+                    "Symbol",
+                    "Name",
+                    "Price (USD)",
+                    "Market Cap (USD)",
+                    "Volume 24h (USD)",
+                    "% Change 24h",
+                ]
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+                try:
+                    import plotly.graph_objects as go
+
+                    fig = go.Figure(
+                        data=[
+                            go.Bar(
+                                x=cmc_top_df["symbol"],
+                                y=cmc_top_df["market_cap"],
+                                name="Market Cap",
+                                hovertemplate="<b>%{x}</b><br>Market Cap: %{y:,.0f} USD<extra></extra>",
+                            )
+                        ]
+                    )
+                    fig.update_layout(
+                        title="Market Cap by Asset (Top Snapshot)",
+                        xaxis_title="Asset",
+                        yaxis_title="Market Cap (USD)",
+                        height=350,
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                except Exception:
+                    pass
+
+        with col2:
+            st.subheader("Integrated Daily (CMC vs Binance vs Ethereum)")
+            with st.spinner("Loading integrated daily analysis..."):
+                try:
+                    integrated_df = utils.fetch_integrated_daily_data(
+                        start_date=str(start_date),
+                        end_date=str(end_date),
+                        _conn=conn,
+                    )
+                except Exception as e:
+                    integrated_df = pd.DataFrame()
+                    st.error(f"Error loading integrated daily analysis: {e}")
+
+            if integrated_df.empty:
+                st.info("No integrated daily data found. Run `pipeline_4_analytics` to populate `dw.analysis_integrated_daily`.")
+            else:
+                base_symbol = "N/A"
+                if "base_symbol" in integrated_df.columns:
+                    non_null_symbols = integrated_df["base_symbol"].dropna()
+                    if not non_null_symbols.empty:
+                        base_symbol = non_null_symbols.iloc[0]
+                st.caption(f"Base symbol: {base_symbol}")
+
+                try:
+                    import plotly.graph_objects as go
+
+                    fig_price = go.Figure()
+                    fig_price.add_trace(
+                        go.Scatter(
+                            x=integrated_df["trading_date"],
+                            y=integrated_df["cmc_price_usd"],
+                            name="CMC Price (USD)",
+                            mode="lines+markers",
+                        )
+                    )
+                    fig_price.add_trace(
+                        go.Scatter(
+                            x=integrated_df["trading_date"],
+                            y=integrated_df["binance_avg_close_usdt"],
+                            name="Binance Avg Close (USDT)",
+                            mode="lines+markers",
+                        )
+                    )
+                    fig_price.update_layout(
+                        title="CMC vs Binance Price (Daily)",
+                        xaxis_title="Date",
+                        yaxis_title="Price",
+                        height=350,
+                        hovermode="x unified",
+                    )
+                    st.plotly_chart(fig_price, use_container_width=True)
+
+                    fig_fee = go.Figure(
+                        data=[
+                            go.Scatter(
+                                x=integrated_df["trading_date"],
+                                y=integrated_df["eth_avg_base_fee_gwei"],
+                                name="ETH Avg Base Fee (gwei)",
+                                mode="lines+markers",
+                            )
+                        ]
+                    )
+                    fig_fee.update_layout(
+                        title="Ethereum Base Fee (Daily)",
+                        xaxis_title="Date",
+                        yaxis_title="Base Fee (gwei)",
+                        height=300,
+                        hovermode="x unified",
+                    )
+                    st.plotly_chart(fig_fee, use_container_width=True)
+                except Exception:
+                    pass
+
+                display_df = integrated_df[[
+                    "trading_date",
+                    "cmc_price_usd",
+                    "cmc_market_cap",
+                    "binance_avg_close_usdt",
+                    "binance_avg_volume_usdt",
+                    "eth_avg_base_fee_gwei",
+                ]].copy()
+                display_df["trading_date"] = display_df["trading_date"].dt.strftime("%Y-%m-%d")
+                display_df.columns = [
+                    "Date",
+                    "CMC Price (USD)",
+                    "CMC Market Cap (USD)",
+                    "Binance Avg Close (USDT)",
+                    "Binance Avg Volume (USDT)",
+                    "ETH Avg Base Fee (gwei)",
+                ]
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    with tabs[4]:
         st.header("Historical Correlation Trends")
 
         if not historical_df.empty:
@@ -314,7 +481,7 @@ def main():
         else:
             st.info("No historical data available. The analysis DAG needs to run multiple times to build historical trends.")
 
-    with tabs[4]:
+    with tabs[5]:
         st.header("Raw Data")
 
         st.subheader("Hourly Aggregated Data")
