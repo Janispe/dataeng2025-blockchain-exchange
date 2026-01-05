@@ -20,13 +20,13 @@ def main():
 
     st.sidebar.header("Filters & Settings")
 
-    default_end = datetime.now()
-    default_start = default_end - timedelta(days=30)
+    # Default dates for sample data (adjust these to match your data range)
+    default_start = datetime(2026, 1, 1).date()
+    default_end = datetime(2026, 1, 6).date()
 
     start_date = st.sidebar.date_input(
         "Start Date",
         value=default_start,
-        max_value=default_end,
     )
 
     end_date = st.sidebar.date_input(

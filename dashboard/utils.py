@@ -1,10 +1,69 @@
 import os
+import json
 from typing import Optional, Any
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
+
+
+@st.cache_resource
+def get_redis_connection():
+    """Get Redis connection (optional, falls back gracefully)."""
+    try:
+        import redis
+        r = redis.Redis(
+            host=os.getenv("REDIS_HOST", "redis"),
+            port=int(os.getenv("REDIS_PORT", "6379")),
+            db=int(os.getenv("REDIS_DB", "1")),
+            decode_responses=True,
+            socket_connect_timeout=2,
+        )
+        r.ping()
+        return r
+    except Exception:
+        return None
+
+
+def redis_cached(key_prefix: str, ttl: int = 300):
+    """Redis cache decorator with fallback to Streamlit cache."""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            redis_conn = get_redis_connection()
+            if redis_conn is None:
+                return func(*args, **kwargs)
+
+            # Build cache key from args
+            cache_key = f"{key_prefix}:{':'.join(str(a) for a in args if a is not None)}"
+
+            try:
+                cached = redis_conn.get(cache_key)
+                if cached:
+                    data = json.loads(cached)
+                    if "dataframe" in data:
+                        return pd.read_json(data["dataframe"], orient="split")
+                    return data.get("result")
+            except Exception:
+                pass
+
+            result = func(*args, **kwargs)
+
+            try:
+                if isinstance(result, pd.DataFrame):
+                    redis_conn.setex(
+                        cache_key,
+                        ttl,
+                        json.dumps({"dataframe": result.to_json(orient="split", date_format="iso")})
+                    )
+                elif isinstance(result, dict):
+                    redis_conn.setex(cache_key, ttl, json.dumps({"result": result}))
+            except Exception:
+                pass
+
+            return result
+        return wrapper
+    return decorator
 
 
 @st.cache_resource
@@ -31,6 +90,7 @@ def get_db_connection():
 
 
 @st.cache_data(ttl=300)
+@redis_cached("hourly_data", ttl=180)
 def fetch_hourly_data(
     start_date: str,
     end_date: str,
@@ -66,6 +126,7 @@ def fetch_hourly_data(
 
 
 @st.cache_data(ttl=300)
+@redis_cached("summary_stats", ttl=180)
 def fetch_summary_stats(
     start_date: str,
     end_date: str,
@@ -103,6 +164,7 @@ def fetch_summary_stats(
 
 
 @st.cache_data(ttl=300)
+@redis_cached("historical_trends", ttl=240)
 def fetch_historical_trends(
     lookback_runs: int = 10,
     _conn: Optional[Any] = None,

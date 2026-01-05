@@ -452,6 +452,9 @@ services:
       - DW_PG_DB=${DATA_POSTGRES_DB:-datadb}
       - DW_PG_USER=${DATA_POSTGRES_USER:-datauser}
       - DW_PG_PASSWORD=${DATA_POSTGRES_PASSWORD:-datapass}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=1
     ports:
       - "8501:8501"
     volumes:
@@ -459,6 +462,8 @@ services:
       - ./data/analysis:/app/data/analysis:ro
     depends_on:
       postgres-data:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     restart: unless-stopped
     networks:
