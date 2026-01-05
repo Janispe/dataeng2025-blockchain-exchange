@@ -382,7 +382,7 @@ def pipeline_4_analytics():
                     SELECT COUNT(*)
                     FROM {DW_SCHEMA}.analysis_integrated_daily
                     WHERE trading_date >= %(window_start)s::date
-                      AND trading_date < %(window_end)s::date
+                      AND trading_date <= %(window_end)s::date
                     """,
                     params,
                 )
@@ -445,7 +445,7 @@ def pipeline_4_analytics():
             WITH
             hourly_price AS (
               SELECT
-                date_trunc('hour', t.ts_utc) AS hour_ts,
+                date_trunc('minute', t.ts_utc) - INTERVAL '1 minute' * (EXTRACT(minute FROM t.ts_utc)::int %% 10) AS hour_ts,
                 AVG(f.close) AS avg_close_usdt,
                 AVG(f.quote_asset_volume) AS avg_volume_usdt
               FROM {DW_SCHEMA}.fact_binance_candle f
@@ -463,7 +463,7 @@ def pipeline_4_analytics():
             ),
             hourly_gas AS (
               SELECT
-                date_trunc('hour', t.ts_utc) AS hour_ts,
+                date_trunc('minute', t.ts_utc) - INTERVAL '1 minute' * (EXTRACT(minute FROM t.ts_utc)::int %% 10) AS hour_ts,
                 AVG(f.base_fee_per_gas::numeric) / 1e9 AS avg_base_fee_gwei
               FROM {DW_SCHEMA}.fact_ethereum_block f
               JOIN {DW_SCHEMA}.dim_time t ON t.time_key = f.block_time_key
