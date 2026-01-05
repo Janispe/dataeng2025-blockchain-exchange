@@ -74,7 +74,7 @@ def _pg_connect(settings: Settings):
     catchup=False,
     tags=["pipeline-4", "analytics", "analysis", "correlation"],
     default_args=dict(retries=2, retry_delay=pendulum.duration(minutes=2)),
-    description="Pipeline 4: Analytics - Analysiert Korrelation zwischen ETH-Preis (Binance) und Gas-Gebühren (Ethereum).",
+    description="Pipeline 4: Analytics - Analysiert Korrelation zwischen ETH-Preis (Binance, CoinMarketCap) und Gas-Gebühren (Ethereum).",
 )
 def pipeline_4_analytics():
     @task
@@ -137,6 +137,9 @@ def pipeline_4_analytics():
                       hour_ts TIMESTAMPTZ PRIMARY KEY,
                       avg_close_usdt NUMERIC,
                       avg_volume_usdt NUMERIC,
+                      avg_cmc_price_usd NUMERIC,
+                      avg_cmc_market_cap NUMERIC,
+                      avg_cmc_volume_24h NUMERIC,
                       avg_base_fee_gwei NUMERIC,
                       computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
@@ -155,7 +158,10 @@ def pipeline_4_analytics():
                       chain_name TEXT NOT NULL,
                       n_hours INTEGER NOT NULL,
                       corr_price_vs_base_fee_gwei NUMERIC,
-                      corr_volume_vs_base_fee_gwei NUMERIC
+                      corr_volume_vs_base_fee_gwei NUMERIC,
+                      corr_cmc_price_vs_base_fee_gwei NUMERIC,
+                      corr_cmc_market_cap_vs_base_fee_gwei NUMERIC,
+                      corr_binance_vs_cmc_price NUMERIC
                     );
                     """
                 )
@@ -184,6 +190,21 @@ def pipeline_4_analytics():
                 AND t.ts_utc < %(window_end)s
               GROUP BY 1
             ),
+            hourly_cmc AS (
+              SELECT
+                date_trunc('hour', t.ts_utc) AS hour_ts,
+                AVG(f.price_usd) AS avg_cmc_price_usd,
+                AVG(f.market_cap) AS avg_cmc_market_cap,
+                AVG(f.volume_24h) AS avg_cmc_volume_24h
+              FROM {DW_SCHEMA}.fact_crypto_market f
+              JOIN {DW_SCHEMA}.dim_time t ON t.time_key = f.recorded_time_key
+              JOIN {DW_SCHEMA}.dim_asset a ON a.asset_key = f.asset_key
+              WHERE a.base_asset = 'ETH'
+                AND f.price_usd IS NOT NULL
+                AND t.ts_utc >= %(window_start)s
+                AND t.ts_utc < %(window_end)s
+              GROUP BY 1
+            ),
             hourly_gas AS (
               SELECT
                 date_trunc('hour', t.ts_utc) AS hour_ts,
@@ -198,18 +219,35 @@ def pipeline_4_analytics():
               GROUP BY 1
             ),
             joined AS (
-              SELECT p.hour_ts, p.avg_close_usdt, p.avg_volume_usdt, g.avg_base_fee_gwei
+              SELECT
+                COALESCE(p.hour_ts, cmc.hour_ts, g.hour_ts) AS hour_ts,
+                p.avg_close_usdt,
+                p.avg_volume_usdt,
+                cmc.avg_cmc_price_usd,
+                cmc.avg_cmc_market_cap,
+                cmc.avg_cmc_volume_24h,
+                g.avg_base_fee_gwei
               FROM hourly_price p
-              JOIN hourly_gas g USING (hour_ts)
+              FULL OUTER JOIN hourly_cmc cmc USING (hour_ts)
+              FULL OUTER JOIN hourly_gas g USING (hour_ts)
+              WHERE COALESCE(p.hour_ts, cmc.hour_ts, g.hour_ts) IS NOT NULL
             )
             INSERT INTO {DW_SCHEMA}.analysis_eth_price_vs_gas_fee_hourly (
-              hour_ts, avg_close_usdt, avg_volume_usdt, avg_base_fee_gwei
+              hour_ts, avg_close_usdt, avg_volume_usdt,
+              avg_cmc_price_usd, avg_cmc_market_cap, avg_cmc_volume_24h,
+              avg_base_fee_gwei
             )
-            SELECT hour_ts, avg_close_usdt, avg_volume_usdt, avg_base_fee_gwei
+            SELECT
+              hour_ts, avg_close_usdt, avg_volume_usdt,
+              avg_cmc_price_usd, avg_cmc_market_cap, avg_cmc_volume_24h,
+              avg_base_fee_gwei
             FROM joined
             ON CONFLICT (hour_ts) DO UPDATE SET
               avg_close_usdt = EXCLUDED.avg_close_usdt,
               avg_volume_usdt = EXCLUDED.avg_volume_usdt,
+              avg_cmc_price_usd = EXCLUDED.avg_cmc_price_usd,
+              avg_cmc_market_cap = EXCLUDED.avg_cmc_market_cap,
+              avg_cmc_volume_24h = EXCLUDED.avg_cmc_volume_24h,
               avg_base_fee_gwei = EXCLUDED.avg_base_fee_gwei,
               computed_at = NOW()
             """
@@ -233,6 +271,9 @@ def pipeline_4_analytics():
                     SELECT
                       corr(avg_close_usdt, avg_base_fee_gwei) AS corr_price_vs_base_fee,
                       corr(avg_volume_usdt, avg_base_fee_gwei) AS corr_volume_vs_base_fee,
+                      corr(avg_cmc_price_usd, avg_base_fee_gwei) AS corr_cmc_price_vs_base_fee,
+                      corr(avg_cmc_market_cap, avg_base_fee_gwei) AS corr_cmc_market_cap_vs_base_fee,
+                      corr(avg_close_usdt, avg_cmc_price_usd) AS corr_binance_vs_cmc_price,
                       COUNT(*) AS n_hours
                     FROM {DW_SCHEMA}.analysis_eth_price_vs_gas_fee_hourly
                     WHERE hour_ts >= %(window_start)s
@@ -243,7 +284,10 @@ def pipeline_4_analytics():
                 row = cur.fetchone()
                 corr_price_val: Optional[float] = row[0] if row else None
                 corr_volume_val: Optional[float] = row[1] if row else None
-                n_hours = int(row[2]) if row and row[2] is not None else 0
+                corr_cmc_price_val: Optional[float] = row[2] if row else None
+                corr_cmc_market_cap_val: Optional[float] = row[3] if row else None
+                corr_binance_vs_cmc_val: Optional[float] = row[4] if row else None
+                n_hours = int(row[5]) if row and row[5] is not None else 0
 
                 if n_hours < 3:
                     raise AirflowSkipException(
@@ -255,15 +299,26 @@ def pipeline_4_analytics():
                     INSERT INTO {DW_SCHEMA}.analysis_eth_price_vs_gas_fee_summary (
                       window_start, window_end,
                       asset_symbol, binance_interval, exchange_name, chain_name,
-                      n_hours, corr_price_vs_base_fee_gwei, corr_volume_vs_base_fee_gwei
+                      n_hours, corr_price_vs_base_fee_gwei, corr_volume_vs_base_fee_gwei,
+                      corr_cmc_price_vs_base_fee_gwei, corr_cmc_market_cap_vs_base_fee_gwei,
+                      corr_binance_vs_cmc_price
                     )
                     VALUES (
                       %(window_start)s, %(window_end)s,
                       %(asset_symbol)s, %(binance_interval)s, %(exchange_name)s, %(chain_name)s,
-                      %(n_hours)s, %(corr_price_val)s, %(corr_volume_val)s
+                      %(n_hours)s, %(corr_price_val)s, %(corr_volume_val)s,
+                      %(corr_cmc_price_val)s, %(corr_cmc_market_cap_val)s, %(corr_binance_vs_cmc_val)s
                     )
                     """,
-                    {**params, "n_hours": n_hours, "corr_price_val": corr_price_val, "corr_volume_val": corr_volume_val},
+                    {
+                        **params,
+                        "n_hours": n_hours,
+                        "corr_price_val": corr_price_val,
+                        "corr_volume_val": corr_volume_val,
+                        "corr_cmc_price_val": corr_cmc_price_val,
+                        "corr_cmc_market_cap_val": corr_cmc_market_cap_val,
+                        "corr_binance_vs_cmc_val": corr_binance_vs_cmc_val,
+                    },
                 )
             conn.commit()
 
@@ -275,6 +330,9 @@ def pipeline_4_analytics():
                 "n_hours": n_hours,
                 "corr_price_vs_base_fee_gwei": corr_price_val,
                 "corr_volume_vs_base_fee_gwei": corr_volume_val,
+                "corr_cmc_price_vs_base_fee_gwei": corr_cmc_price_val,
+                "corr_cmc_market_cap_vs_base_fee_gwei": corr_cmc_market_cap_val,
+                "corr_binance_vs_cmc_price": corr_binance_vs_cmc_val,
                 "hourly_table": f"{DW_SCHEMA}.analysis_eth_price_vs_gas_fee_hourly",
                 "summary_table": f"{DW_SCHEMA}.analysis_eth_price_vs_gas_fee_summary",
             }
@@ -289,7 +347,9 @@ def pipeline_4_analytics():
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
-                    SELECT hour_ts, avg_close_usdt, avg_volume_usdt, avg_base_fee_gwei
+                    SELECT hour_ts, avg_close_usdt, avg_volume_usdt,
+                           avg_cmc_price_usd, avg_cmc_market_cap, avg_cmc_volume_24h,
+                           avg_base_fee_gwei
                     FROM {DW_SCHEMA}.analysis_eth_price_vs_gas_fee_hourly
                     WHERE hour_ts >= %(window_start)s
                       AND hour_ts < %(window_end)s
@@ -319,52 +379,69 @@ def pipeline_4_analytics():
             hour_ts = [r[0] for r in rows]
             price = [float(r[1]) if r[1] is not None else float("nan") for r in rows]
             volume = [float(r[2]) if r[2] is not None else float("nan") for r in rows]
-            base_fee = [
-                float(r[3]) if r[3] is not None else float("nan") for r in rows
-            ]
+            cmc_price = [float(r[3]) if r[3] is not None else float("nan") for r in rows]
+            cmc_market_cap = [float(r[4]) if r[4] is not None else float("nan") for r in rows]
+            cmc_volume_24h = [float(r[5]) if r[5] is not None else float("nan") for r in rows]
+            base_fee = [float(r[6]) if r[6] is not None else float("nan") for r in rows]
 
             out_dir = Path(settings.output_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
             run_ts = pendulum.now("UTC").format("YYYYMMDDTHHmmss") + "Z"
             out_path = out_dir / f"{run_ts}_{settings.asset_symbol}_{settings.binance_interval}.png"
 
-            fig = plt.figure(figsize=(16, 10))
+            fig = plt.figure(figsize=(20, 12))
 
             corr_price = result.get("corr_price_vs_base_fee_gwei")
             corr_volume = result.get("corr_volume_vs_base_fee_gwei")
+            corr_cmc_price = result.get("corr_cmc_price_vs_base_fee_gwei")
+            corr_cmc_market_cap = result.get("corr_cmc_market_cap_vs_base_fee_gwei")
+            corr_binance_vs_cmc = result.get("corr_binance_vs_cmc_price")
 
-            # (1) Price vs Base Fee - Time series
-            ax1 = fig.add_subplot(2, 2, 1)
-            ax1.plot(hour_ts, price, color="tab:blue", linewidth=1.2, label="ETH close (USDT)")
-            ax1.set_ylabel("ETH close (USDT)", color="tab:blue")
+            # ===== ROW 1: TIME SERIES =====
+
+            # (1) Binance Price vs Base Fee - Time series
+            ax1 = fig.add_subplot(2, 3, 1)
+            ax1.plot(hour_ts, price, color="tab:blue", linewidth=1.2, label="Binance ETH (USDT)")
+            ax1.set_ylabel("Binance ETH (USDT)", color="tab:blue")
             ax1.tick_params(axis="y", labelcolor="tab:blue")
             ax1.grid(True, alpha=0.25)
-            ax1.set_title(f"Price vs Base Fee | corr={corr_price:.3f}" if corr_price else "Price vs Base Fee")
+            ax1.set_title(f"Binance Price vs Gas | corr={corr_price:.3f}" if corr_price else "Binance Price vs Gas")
 
             ax1b = ax1.twinx()
             ax1b.plot(hour_ts, base_fee, color="tab:orange", linewidth=1.2, label="Base fee (gwei)")
             ax1b.set_ylabel("Base fee (gwei)", color="tab:orange")
             ax1b.tick_params(axis="y", labelcolor="tab:orange")
 
-            # (2) Volume vs Base Fee - Time series
-            ax2 = fig.add_subplot(2, 2, 2)
-            ax2.plot(hour_ts, volume, color="tab:green", linewidth=1.2, label="Volume (USDT)")
-            ax2.set_ylabel("Volume (USDT)", color="tab:green")
-            ax2.tick_params(axis="y", labelcolor="tab:green")
+            # (2) CMC Price vs Base Fee - Time series
+            ax2 = fig.add_subplot(2, 3, 2)
+            ax2.plot(hour_ts, cmc_price, color="tab:purple", linewidth=1.2, label="CMC ETH (USD)")
+            ax2.set_ylabel("CMC ETH (USD)", color="tab:purple")
+            ax2.tick_params(axis="y", labelcolor="tab:purple")
             ax2.grid(True, alpha=0.25)
-            ax2.set_title(f"Volume vs Base Fee | corr={corr_volume:.3f}" if corr_volume else "Volume vs Base Fee")
+            ax2.set_title(f"CMC Price vs Gas | corr={corr_cmc_price:.3f}" if corr_cmc_price else "CMC Price vs Gas")
 
             ax2b = ax2.twinx()
             ax2b.plot(hour_ts, base_fee, color="tab:orange", linewidth=1.2, label="Base fee (gwei)")
             ax2b.set_ylabel("Base fee (gwei)", color="tab:orange")
             ax2b.tick_params(axis="y", labelcolor="tab:orange")
 
-            # (3) Price vs Base Fee - Scatter
-            ax3 = fig.add_subplot(2, 2, 3)
-            ax3.scatter(base_fee, price, s=20, alpha=0.6, color="tab:blue")
-            ax3.set_xlabel("Avg base fee (gwei)")
-            ax3.set_ylabel("Avg close (USDT)")
+            # (3) Binance vs CMC Price Comparison - Time series
+            ax3 = fig.add_subplot(2, 3, 3)
+            ax3.plot(hour_ts, price, color="tab:blue", linewidth=1.2, label="Binance", alpha=0.7)
+            ax3.plot(hour_ts, cmc_price, color="tab:purple", linewidth=1.2, label="CoinMarketCap", alpha=0.7)
+            ax3.set_ylabel("Price (USD/USDT)")
             ax3.grid(True, alpha=0.25)
+            ax3.legend(loc="upper left")
+            ax3.set_title(f"Binance vs CMC | corr={corr_binance_vs_cmc:.3f}" if corr_binance_vs_cmc else "Binance vs CMC")
+
+            # ===== ROW 2: SCATTER PLOTS =====
+
+            # (4) Binance Price vs Base Fee - Scatter
+            ax4 = fig.add_subplot(2, 3, 4)
+            ax4.scatter(base_fee, price, s=20, alpha=0.6, color="tab:blue")
+            ax4.set_xlabel("Avg base fee (gwei)")
+            ax4.set_ylabel("Binance close (USDT)")
+            ax4.grid(True, alpha=0.25)
 
             x_price = np.array(base_fee, dtype=float)
             y_price = np.array(price, dtype=float)
@@ -372,22 +449,37 @@ def pipeline_4_analytics():
             if mask_price.sum() >= 2:
                 m, b = np.polyfit(x_price[mask_price], y_price[mask_price], 1)
                 x_line = np.linspace(x_price[mask_price].min(), x_price[mask_price].max(), 100)
-                ax3.plot(x_line, m * x_line + b, color="black", linewidth=1.2, alpha=0.8)
-
-            # (4) Volume vs Base Fee - Scatter
-            ax4 = fig.add_subplot(2, 2, 4)
-            ax4.scatter(base_fee, volume, s=20, alpha=0.6, color="tab:green")
-            ax4.set_xlabel("Avg base fee (gwei)")
-            ax4.set_ylabel("Avg volume (USDT)")
-            ax4.grid(True, alpha=0.25)
-
-            x_vol = np.array(base_fee, dtype=float)
-            y_vol = np.array(volume, dtype=float)
-            mask_vol = np.isfinite(x_vol) & np.isfinite(y_vol)
-            if mask_vol.sum() >= 2:
-                m, b = np.polyfit(x_vol[mask_vol], y_vol[mask_vol], 1)
-                x_line = np.linspace(x_vol[mask_vol].min(), x_vol[mask_vol].max(), 100)
                 ax4.plot(x_line, m * x_line + b, color="black", linewidth=1.2, alpha=0.8)
+
+            # (5) CMC Price vs Base Fee - Scatter
+            ax5 = fig.add_subplot(2, 3, 5)
+            ax5.scatter(base_fee, cmc_price, s=20, alpha=0.6, color="tab:purple")
+            ax5.set_xlabel("Avg base fee (gwei)")
+            ax5.set_ylabel("CMC price (USD)")
+            ax5.grid(True, alpha=0.25)
+
+            x_cmc = np.array(base_fee, dtype=float)
+            y_cmc = np.array(cmc_price, dtype=float)
+            mask_cmc = np.isfinite(x_cmc) & np.isfinite(y_cmc)
+            if mask_cmc.sum() >= 2:
+                m, b = np.polyfit(x_cmc[mask_cmc], y_cmc[mask_cmc], 1)
+                x_line = np.linspace(x_cmc[mask_cmc].min(), x_cmc[mask_cmc].max(), 100)
+                ax5.plot(x_line, m * x_line + b, color="black", linewidth=1.2, alpha=0.8)
+
+            # (6) Binance vs CMC Price - Scatter
+            ax6 = fig.add_subplot(2, 3, 6)
+            ax6.scatter(cmc_price, price, s=20, alpha=0.6, color="tab:cyan")
+            ax6.set_xlabel("CMC price (USD)")
+            ax6.set_ylabel("Binance close (USDT)")
+            ax6.grid(True, alpha=0.25)
+
+            x_comp = np.array(cmc_price, dtype=float)
+            y_comp = np.array(price, dtype=float)
+            mask_comp = np.isfinite(x_comp) & np.isfinite(y_comp)
+            if mask_comp.sum() >= 2:
+                m, b = np.polyfit(x_comp[mask_comp], y_comp[mask_comp], 1)
+                x_line = np.linspace(x_comp[mask_comp].min(), x_comp[mask_comp].max(), 100)
+                ax6.plot(x_line, m * x_line + b, color="black", linewidth=1.2, alpha=0.8)
 
             fig.tight_layout()
             fig.savefig(out_path, dpi=150)

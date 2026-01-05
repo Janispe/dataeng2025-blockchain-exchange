@@ -10,9 +10,9 @@ Data flow (granular steps):
 
 Star Schema:
 - Dimensions: dim_time, dim_asset, dim_interval, dim_exchange, dim_chain
-- Facts: fact_binance_candle, fact_ethereum_block
+- Facts: fact_binance_candle, fact_ethereum_block, fact_crypto_market
 
-Input: Postgres Staging Zone (staging.binance_candles, staging.ethereum_blocks)
+Input: Postgres Staging Zone (staging.binance_candles, staging.ethereum_blocks, staging.crypto_metrics, staging.cryptocurrencies)
 Output: Postgres Data Warehouse (dw.* Star Schema)
 """
 from __future__ import annotations
@@ -50,6 +50,7 @@ DEFAULT_BATCH_SIZE_BLOCKS = 500
 
 CHECKPOINT_BINANCE_VAR = "DW_LAST_BINANCE_STAGING_AT"
 CHECKPOINT_ETHERSCAN_VAR = "DW_LAST_ETHERSCAN_STAGING_AT"
+CHECKPOINT_COINMARKETCAP_VAR = "DW_LAST_COINMARKETCAP_PROCESSED_AT"
 
 
 def _pg_connect(settings: "Settings"):
@@ -253,6 +254,31 @@ def _ensure_dw_schema(conn) -> None:
 
     CREATE INDEX IF NOT EXISTS ix_fact_ethereum_block_time_key
       ON {DW_SCHEMA}.fact_ethereum_block (block_time_key);
+
+    CREATE TABLE IF NOT EXISTS {DW_SCHEMA}.fact_crypto_market (
+      market_key BIGSERIAL PRIMARY KEY,
+      asset_key INTEGER NOT NULL REFERENCES {DW_SCHEMA}.dim_asset(asset_key),
+      recorded_time_key BIGINT NOT NULL REFERENCES {DW_SCHEMA}.dim_time(time_key),
+
+      price_usd NUMERIC(20, 8),
+      volume_24h NUMERIC(20, 2),
+      market_cap NUMERIC(20, 2),
+      percent_change_1h NUMERIC(10, 4),
+      percent_change_24h NUMERIC(10, 4),
+      percent_change_7d NUMERIC(10, 4),
+      circulating_supply NUMERIC(20, 2),
+      total_supply NUMERIC(20, 2),
+      max_supply NUMERIC(20, 2),
+
+      processed_at TIMESTAMPTZ,
+
+      UNIQUE (asset_key, recorded_time_key)
+    );
+
+    CREATE INDEX IF NOT EXISTS ix_fact_crypto_market_recorded_time_key
+      ON {DW_SCHEMA}.fact_crypto_market (recorded_time_key);
+    CREATE INDEX IF NOT EXISTS ix_fact_crypto_market_asset_key
+      ON {DW_SCHEMA}.fact_crypto_market (asset_key);
     """
     with conn.cursor() as cur:
         cur.execute(ddl)
@@ -363,7 +389,7 @@ class Settings:
     catchup=False,
     tags=["pipeline-3", "production", "star-schema", "dw"],
     default_args=dict(retries=2, retry_delay=pendulum.duration(minutes=2)),
-    description="Pipeline 3: Loads Staging data (Binance, Ethereum) into Star Schema (Production Zone / Data Warehouse).",
+    description="Pipeline 3: Loads Staging data (Binance, Ethereum, CoinMarketCap) into Star Schema (Production Zone / Data Warehouse).",
 )
 def pipeline_3_production():
 
@@ -852,16 +878,218 @@ def pipeline_3_production():
         finally:
             conn.close()
 
+    # ========== COINMARKETCAP PIPELINE ==========
+
+    @task
+    def fetch_coinmarketcap_from_staging(settings_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Step 1: Reads CoinMarketCap data from Staging Zone"""
+        settings = Settings(**settings_dict)
+        checkpoint = Variable.get(CHECKPOINT_COINMARKETCAP_VAR, default_var=None)
+
+        where_clause = ""
+        params_list: List[Any] = []
+        if checkpoint:
+            where_clause = f"WHERE cm.recorded_at > %s"
+            params_list.append(checkpoint)
+
+        conn = _pg_connect(settings)
+        try:
+            with conn.cursor() as cur:
+                query = f"""
+                SELECT
+                    c.symbol, cm.price_usd, cm.volume_24h, cm.market_cap,
+                    cm.percent_change_1h, cm.percent_change_24h, cm.percent_change_7d,
+                    cm.circulating_supply, cm.total_supply, cm.max_supply,
+                    cm.recorded_at
+                FROM {STAGING_SCHEMA}.crypto_metrics cm
+                JOIN {STAGING_SCHEMA}.cryptocurrencies c ON cm.crypto_id = c.crypto_id
+                {where_clause}
+                ORDER BY cm.recorded_at
+                """
+                cur.execute(query, params_list)
+
+                staging_data: List[Dict[str, Any]] = []
+                for row in cur:
+                    staging_data.append({
+                        "symbol": row[0],
+                        "price_usd": row[1],
+                        "volume_24h": row[2],
+                        "market_cap": row[3],
+                        "percent_change_1h": row[4],
+                        "percent_change_24h": row[5],
+                        "percent_change_7d": row[6],
+                        "circulating_supply": row[7],
+                        "total_supply": row[8],
+                        "max_supply": row[9],
+                        "recorded_at": row[10],
+                    })
+
+            if not staging_data:
+                raise AirflowSkipException("No new CoinMarketCap data found in Staging")
+
+            print(f"📂 CoinMarketCap: {len(staging_data)} records read from Staging")
+            return {
+                "staging_data": staging_data,
+                "checkpoint": checkpoint,
+                "settings": settings_dict
+            }
+        finally:
+            conn.close()
+
+    @task
+    def transform_coinmarketcap_to_star_schema(fetch_result: Dict[str, Any]) -> Dict[str, Any]:
+        """Step 2: Creates dimensions and maps CoinMarketCap data to dimension keys"""
+        staging_data = fetch_result["staging_data"]
+        settings = Settings(**fetch_result["settings"])
+
+        conn = _pg_connect(settings)
+        try:
+            # Extract unique values for dimensions
+            symbols = sorted({(d.get("symbol") or "").strip().upper() for d in staging_data if d.get("symbol")})
+
+            ts_set = set()
+            for d in staging_data:
+                recorded_at = d.get("recorded_at")
+                if isinstance(recorded_at, str):
+                    try:
+                        rt = pendulum.parse(recorded_at).in_timezone("UTC")
+                        ts_set.add(rt)
+                    except Exception:
+                        pass
+                elif isinstance(recorded_at, datetime):
+                    ts_set.add(recorded_at)
+
+            # Ensure dimensions exist
+            _ensure_dim_assets(conn, symbols)
+            _ensure_dim_time(conn, sorted(ts_set))
+
+            # Get dimension mappings
+            with conn.cursor() as cur:
+                asset_map = _fetch_mapping_any(cur, "dim_asset", "symbol", "asset_key", symbols)
+                time_map = _fetch_mapping_any(cur, "dim_time", "ts_utc", "time_key", list(ts_set))
+
+            # Transform to fact rows with dimension keys
+            transformed_rows: List[Tuple[Any, ...]] = []
+            last_recorded_at: Optional[str] = fetch_result["checkpoint"]
+
+            for d in staging_data:
+                symbol = (d.get("symbol") or "").strip().upper()
+                recorded_at = d.get("recorded_at")
+
+                # Parse recorded_at to datetime
+                recorded_dt = None
+                if isinstance(recorded_at, str):
+                    try:
+                        recorded_dt = pendulum.parse(recorded_at).in_timezone("UTC")
+                    except Exception:
+                        continue
+                elif isinstance(recorded_at, datetime):
+                    recorded_dt = recorded_at
+                else:
+                    continue
+
+                if not symbol or not recorded_dt:
+                    continue
+
+                asset_key = asset_map.get(symbol)
+                recorded_time_key = time_map.get(recorded_dt)
+
+                if not asset_key or not recorded_time_key:
+                    continue
+
+                if recorded_at:
+                    last_recorded_at = str(recorded_at)
+
+                transformed_rows.append((
+                    asset_key,
+                    recorded_time_key,
+                    d.get("price_usd"),
+                    d.get("volume_24h"),
+                    d.get("market_cap"),
+                    d.get("percent_change_1h"),
+                    d.get("percent_change_24h"),
+                    d.get("percent_change_7d"),
+                    d.get("circulating_supply"),
+                    d.get("total_supply"),
+                    d.get("max_supply"),
+                    recorded_dt,
+                ))
+
+            if not transformed_rows:
+                raise AirflowSkipException("No valid CoinMarketCap data for DW")
+
+            print(f"🔄 CoinMarketCap: {len(transformed_rows)} rows transformed")
+            print(f"   Dimensions: {len(symbols)} Assets, {len(ts_set)} Timestamps")
+
+            return {
+                "transformed_rows": transformed_rows,
+                "last_recorded_at": last_recorded_at,
+                "checkpoint": fetch_result["checkpoint"],
+                "settings": fetch_result["settings"]
+            }
+        finally:
+            conn.close()
+
+    @task
+    def load_coinmarketcap_to_dw(transform_result: Dict[str, Any]) -> Dict[str, Any]:
+        """Step 3: Loads CoinMarketCap facts into Data Warehouse"""
+        transformed_rows = transform_result["transformed_rows"]
+        settings = Settings(**transform_result["settings"])
+
+        conn = _pg_connect(settings)
+        try:
+            insert_sql = f"""
+            INSERT INTO {DW_SCHEMA}.fact_crypto_market (
+              asset_key, recorded_time_key,
+              price_usd, volume_24h, market_cap,
+              percent_change_1h, percent_change_24h, percent_change_7d,
+              circulating_supply, total_supply, max_supply,
+              processed_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (asset_key, recorded_time_key)
+            DO UPDATE SET
+              price_usd = EXCLUDED.price_usd,
+              volume_24h = EXCLUDED.volume_24h,
+              market_cap = EXCLUDED.market_cap,
+              percent_change_1h = EXCLUDED.percent_change_1h,
+              percent_change_24h = EXCLUDED.percent_change_24h,
+              percent_change_7d = EXCLUDED.percent_change_7d,
+              circulating_supply = EXCLUDED.circulating_supply,
+              total_supply = EXCLUDED.total_supply,
+              max_supply = EXCLUDED.max_supply,
+              processed_at = EXCLUDED.processed_at
+            """
+
+            with conn.cursor() as cur:
+                cur.executemany(insert_sql, transformed_rows)
+            conn.commit()
+
+            # Update checkpoint
+            last_recorded_at = transform_result["last_recorded_at"]
+            checkpoint = transform_result["checkpoint"]
+            if last_recorded_at and last_recorded_at != checkpoint:
+                Variable.set(CHECKPOINT_COINMARKETCAP_VAR, last_recorded_at)
+
+            print(f"💾 CoinMarketCap → DW: {len(transformed_rows)} facts loaded into {DW_SCHEMA}.fact_crypto_market")
+            return {
+                "rows_loaded": len(transformed_rows),
+                "checkpoint": last_recorded_at
+            }
+        finally:
+            conn.close()
+
     # ========== SUMMARY ==========
 
     @task(trigger_rule="all_done")
-    def log_summary(binance_stats: Dict[str, Any], etherscan_stats: Dict[str, Any]) -> None:
+    def log_summary(binance_stats: Dict[str, Any], etherscan_stats: Dict[str, Any], cmc_stats: Dict[str, Any]) -> None:
         """Logs summary of Pipeline 3"""
         print("=" * 70)
         print("Pipeline 3 (Production / Data Warehouse) - Summary:")
         print("=" * 70)
-        print(f"📊 Binance → DW:  {binance_stats}")
-        print(f"⛓️  Ethereum → DW: {etherscan_stats}")
+        print(f"📊 Binance → DW:       {binance_stats}")
+        print(f"⛓️  Ethereum → DW:      {etherscan_stats}")
+        print(f"💰 CoinMarketCap → DW: {cmc_stats}")
         print("=" * 70)
         print(f"✅ Star Schema in '{DW_SCHEMA}' successfully updated!")
         print("=" * 70)
@@ -882,12 +1110,17 @@ def pipeline_3_production():
     ethereum_transform = transform_ethereum_to_star_schema(ethereum_fetch)
     ethereum_result = load_ethereum_to_dw(ethereum_transform)
 
+    # CoinMarketCap: Fetch → Transform → Load
+    cmc_fetch = fetch_coinmarketcap_from_staging(settings)
+    cmc_transform = transform_coinmarketcap_to_star_schema(cmc_fetch)
+    cmc_result = load_coinmarketcap_to_dw(cmc_transform)
+
     # Summary
-    summary = log_summary(binance_result, ethereum_result)
+    summary = log_summary(binance_result, ethereum_result, cmc_result)
 
     # Dependencies
-    schema >> [binance_fetch, ethereum_fetch]
-    [binance_result, ethereum_result] >> summary
+    schema >> [binance_fetch, ethereum_fetch, cmc_fetch]
+    [binance_result, ethereum_result, cmc_result] >> summary
 
 
 pipeline_3_production()
