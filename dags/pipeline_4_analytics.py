@@ -47,6 +47,7 @@ class Settings:
     exchange_name: str
     chain_name: str
     output_dir: str
+    cmc_base_symbol: str
 
 
 def _pg_connect(settings: Settings):
@@ -104,7 +105,9 @@ def pipeline_4_analytics():
         )
         chain_name = Variable.get("ANALYSIS_CHAIN_NAME", default_var=DEFAULT_CHAIN_NAME)
         output_dir = Variable.get("ANALYSIS_OUTPUT_DIR", default_var=DEFAULT_OUTPUT_DIR)
-        cmc_base_symbol = Variable.get("ANALYSIS_CMC_BASE_SYMBOL", default_var=DEFAULT_CMC_BASE_SYMBOL)
+        cmc_base_symbol = Variable.get(
+            "ANALYSIS_CMC_BASE_SYMBOL", default_var=DEFAULT_CMC_BASE_SYMBOL
+        )
 
         try:
             pg_port = int(pg_port_raw)
@@ -127,11 +130,9 @@ def pipeline_4_analytics():
             exchange_name=str(exchange_name).strip(),
             chain_name=str(chain_name).strip(),
             output_dir=str(output_dir).strip(),
+            cmc_base_symbol=str(cmc_base_symbol).strip().upper(),
         )
-        # stash extra config alongside settings without expanding the dataclass
-        d = settings.__dict__
-        d["cmc_base_symbol"] = str(cmc_base_symbol).strip().upper()
-        return d
+        return settings.__dict__
 
     @task
     def run_coinmarketcap_analysis(settings_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -252,7 +253,7 @@ def pipeline_4_analytics():
     @task
     def run_integrated_daily_analysis(settings_dict: Dict[str, Any]) -> Dict[str, Any]:
         settings = Settings(**settings_dict)
-        base_symbol = str(settings_dict.get("cmc_base_symbol") or DEFAULT_CMC_BASE_SYMBOL).strip().upper()
+        base_symbol = settings.cmc_base_symbol or DEFAULT_CMC_BASE_SYMBOL
 
         conn = _pg_connect(settings)
         try:
