@@ -1,15 +1,18 @@
 """
-Pipeline 1: Landing Zone
-=======================
-Loads raw data (from API ingestion or sample files) into the landing zone.
-Also works OFFLINE with sample data (no API keys required).
+Pipeline 1: Landing zone
 
-Landing Zones:
-- MongoDB: binance_candles, etherscan_blocks
-- Postgres: landing_coinmarketcap_raw
+Takes raw files (either from the API ingestion DAG or from sample data) and loads them into the landing DBs.
+This pipeline works offline too, as long as the input files exist.
 
-Input: JSON/JSONL files from data/
-Output: Landing zone databases
+Targets:
+- MongoDB:
+  - binance_candles
+  - etherscan_blocks
+- Postgres:
+  - landing_coinmarketcap_raw
+
+Input: JSON/JSONL under data/
+Output: landing zone databases
 """
 from __future__ import annotations
 
@@ -54,6 +57,7 @@ DEFAULT_BATCH_SIZE = 500
 
 
 def _is_truthy(value: Any) -> bool:
+    # Simple helper for Variables/env flags (accepts "true/yes/1/on", etc.)
     if value is None:
         return False
     if isinstance(value, bool):
@@ -62,11 +66,8 @@ def _is_truthy(value: Any) -> bool:
 
 
 def _resolve_partitioned_files(base_dir: Path, ds: str, pattern: str) -> List[Path]:
-    """
-    By default scan the whole base_dir (load *all* available files).
-    If AIRFLOW Variable LANDING_ONLY_DS_PARTITION=true, prefer only /<base>/<ds>/...
-    (API Ingestion writes partitioned by ds).
-    """
+    # Default: scan the whole folder and load everything that matches the pattern.
+    # If LANDING_ONLY_DS_PARTITION=true, try to load only base_dir/<ds>/... (API ingestion writes this way).
     only_ds_partition = _is_truthy(Variable.get("LANDING_ONLY_DS_PARTITION", default_var="false"))
     if only_ds_partition:
         try:
@@ -79,7 +80,8 @@ def _resolve_partitioned_files(base_dir: Path, ds: str, pattern: str) -> List[Pa
 
 
 def _pg_connect_landing():
-    """PostgreSQL connection for the landing zone (Airflow DB)."""
+    # Postgres connection used for the landing table (CoinMarketCap raw dumps).
+    # Tries psycopg2 first (common in Docker images), then falls back to psycopg.
     try:
         import psycopg2  # type: ignore
 
@@ -114,24 +116,28 @@ def _pg_connect_landing():
 def pipeline_1_landing():
     @task
     def discover_binance_files(ds: str) -> List[str]:
+        # Find Binance JSONL inputs (either all of them, or only ds-partition, depending on config).
         input_dir = BINANCE_INPUT_DIR
         files = _resolve_partitioned_files(input_dir, ds, "*.jsonl")
         return [str(p) for p in files]
 
     @task
     def discover_etherscan_files(ds: str) -> List[str]:
+        # Find Etherscan JSONL inputs.
         input_dir = ETHERSCAN_INPUT_DIR
         files = _resolve_partitioned_files(input_dir, ds, "*.jsonl")
         return [str(p) for p in files]
 
     @task
     def discover_coinmarketcap_files(ds: str) -> List[str]:
+        # Find CoinMarketCap JSON inputs.
         input_dir = COINMARKETCAP_INPUT_DIR
         files = _resolve_partitioned_files(input_dir, ds, "*.json")
         return [str(p) for p in files]
 
     @task
     def cleanup_input_files(file_paths: List[str], delete_variable: str) -> Dict[str, Any]:
+        # Optional cleanup: only deletes files when the matching *DELETE_AFTER_LOAD variable is true.
         if not file_paths:
             return {"attempted": 0, "deleted": 0}
         if not _is_truthy(Variable.get(delete_variable, default_var="false")):
@@ -148,7 +154,7 @@ def pipeline_1_landing():
 
     @task
     def load_binance_to_landing(file_paths: List[str], ds: str) -> Dict[str, Any]:
-        """Loads Binance JSONL files into the MongoDB landing zone."""
+        # Load Binance JSONL candles into MongoDB using upserts (idempotent).
         mongo_uri = Variable.get("MONGO_URI", default_var=DEFAULT_MONGO_URI)
         mongo_db = Variable.get("MONGO_DB", default_var=DEFAULT_MONGO_DB)
         collection_name = Variable.get("BINANCE_MONGO_COLLECTION", default_var=DEFAULT_BINANCE_COLLECTION)
@@ -160,6 +166,8 @@ def pipeline_1_landing():
 
         client = MongoClient(mongo_uri)
         collection = client[mongo_db][collection_name]
+
+        # Uniqueness: one candle per (symbol, interval, open_time_ms)
         collection.create_index([("symbol", 1), ("interval", 1), ("open_time_ms", 1)], unique=True)
         collection.create_index("ingested_at")
         collection.create_index("updated_at")
@@ -183,21 +191,19 @@ def pipeline_1_landing():
                                 stats["rows_skipped"] += 1
                                 continue
 
-                            # Validate required fields
+                            # Minimal sanity check: if these are missing, we can't build a stable key
                             if not all(k in doc for k in ["symbol", "interval", "open_time_ms"]):
                                 stats["rows_skipped"] += 1
                                 continue
 
-                            # Upsert key
                             key = {
                                 "symbol": doc["symbol"],
                                 "interval": doc["interval"],
                                 "open_time_ms": doc["open_time_ms"],
                             }
 
-                            # Avoid conflicting updates: the JSONL docs already contain `ingested_at`
-                            # (API ingestion timestamp). In MongoDB you cannot update the same field
-                            # in both `$set` and `$setOnInsert`.
+                            # The ingestion DAG already writes an `ingested_at`.
+                            # In Mongo you can't `$set` and `$setOnInsert` the same field, so we remap it.
                             source_ingested_at = doc.get("ingested_at")
                             doc_for_set = dict(doc)
                             doc_for_set.pop("ingested_at", None)
@@ -230,7 +236,7 @@ def pipeline_1_landing():
                             stats["rows_skipped"] += 1
                             continue
 
-                # Write remaining batch
+                # Flush anything left for this file
                 if batch:
                     collection.bulk_write(batch, ordered=False)
                     batch.clear()
@@ -251,7 +257,7 @@ def pipeline_1_landing():
 
     @task
     def load_etherscan_to_landing(file_paths: List[str], ds: str) -> Dict[str, Any]:
-        """Loads Ethereum block JSONL files into the MongoDB landing zone."""
+        # Load Etherscan blocks JSONL into MongoDB (also idempotent via upsert).
         mongo_uri = Variable.get("MONGO_URI", default_var=DEFAULT_MONGO_URI)
         mongo_db = Variable.get("MONGO_DB", default_var=DEFAULT_MONGO_DB)
         collection_name = Variable.get("ETHERSCAN_MONGO_COLLECTION", default_var=DEFAULT_ETHERSCAN_COLLECTION)
@@ -262,6 +268,8 @@ def pipeline_1_landing():
 
         client = MongoClient(mongo_uri)
         collection = client[mongo_db][collection_name]
+
+        # Hash + block number are both useful unique keys (sparse because some lines might be incomplete)
         collection.create_index("hash", unique=True, sparse=True)
         collection.create_index("number", unique=True, sparse=True)
         collection.create_index("ingested_at")
@@ -296,7 +304,7 @@ def pipeline_1_landing():
                                 stats["blocks_skipped"] += 1
                                 continue
 
-                            # Enriched document
+                            # Keep a small, query-friendly envelope + store the full raw payload.
                             doc = {
                                 "hash": block_hash,
                                 "number": block_number,
@@ -327,7 +335,7 @@ def pipeline_1_landing():
                             stats["blocks_skipped"] += 1
                             continue
 
-                # Write batch
+                # Flush per-file (blocks are usually not huge here)
                 if operations:
                     collection.bulk_write(operations, ordered=False)
                     operations.clear()
@@ -348,14 +356,14 @@ def pipeline_1_landing():
 
     @task
     def load_coinmarketcap_to_landing(file_paths: List[str], ds: str) -> Dict[str, Any]:
-        """Loads CoinMarketCap JSON files into the Postgres landing zone."""
+        # Load CoinMarketCap JSON dumps into a single Postgres "raw" table (append-only).
         files = [Path(p) for p in (file_paths or [])]
         if not files:
             raise AirflowSkipException(f"Keine CoinMarketCap JSON-Dateien gefunden in {COINMARKETCAP_INPUT_DIR}")
 
         conn = _pg_connect_landing()
         try:
-            # Create landing table
+            # Create landing table if it doesn't exist yet
             with conn.cursor() as cur:
                 cur.execute("""
                 CREATE TABLE IF NOT EXISTS landing_coinmarketcap_raw (
@@ -384,7 +392,7 @@ def pipeline_1_landing():
                             """,
                             (
                                 json.dumps(data),
-                                200,  # assume success
+                                200,  # file-based load: assume it was a successful API response
                                 str(file_path),
                             ),
                         )
@@ -410,7 +418,7 @@ def pipeline_1_landing():
     def log_summary(
         binance: Dict[str, Any], etherscan: Dict[str, Any], cmc: Dict[str, Any]
     ) -> None:
-        """Loggt Zusammenfassung von Pipeline 1"""
+        # Always print the run summary (even when some upstream tasks are skipped).
         print("=" * 60)
         print("Pipeline 1 (Landing Zone) Summary:")
         print("=" * 60)

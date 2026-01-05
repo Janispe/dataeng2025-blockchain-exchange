@@ -1,13 +1,13 @@
 """
-API Ingestion DAG
-=================
-Fetches data from external APIs and stores it as raw data (JSON/JSONL).
-This DAG is OPTIONAL - it can be skipped when working with sample data.
+API ingestion 
 
-APIs:
-- Binance (kline/candle data)
-- Etherscan (Ethereum block data)
-- CoinMarketCap (cryptocurrency data)
+Pulls raw data from a few crypto APIs and saves it as JSON/JSONL.
+You can leave this DAG paused and run the pipelines with sample data instead.
+
+Sources:
+- Binance: klines/candles
+- Etherscan: Ethereum blocks
+- CoinMarketCap: listings (latest / historical if available)
 """
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ DEFAULT_COINMARKETCAP_LIMIT = 100
     schedule="* * * * *",
     catchup=False,
     max_active_runs=1,
-    is_paused_upon_creation=True,  # paused by default (optional; requires API keys)
+    is_paused_upon_creation=True,  # keep it paused by default (needs API keys)
     tags=["api", "ingestion", "optional"],
     default_args=dict(retries=2, retry_delay=pendulum.duration(minutes=5)),
     description="API Ingestion: Ruft Daten von Binance, Etherscan und CoinMarketCap ab (optional, kann mit Sample-Daten übersprungen werden).",
@@ -65,11 +65,9 @@ DEFAULT_COINMARKETCAP_LIMIT = 100
 def api_ingestion():
     @task
     def fetch_binance_klines(ds: str) -> Dict[str, Any]:
-        """
-        Fetches Binance kline data and stores it as JSONL (incremental).
-        Uses per-symbol/interval Airflow Variables as checkpoints (last close_time_ms).
-        Skips if the API is unavailable (or request fails).
-        """
+        # Pull Binance candles incrementally and append them as JSONL.
+        # We keep a per-(symbol, interval) checkpoint in Airflow Variables (last close_time_ms).
+        # If Binance is down / request fails, we just move on to the next symbol.
         symbols_raw = Variable.get("BINANCE_SYMBOLS", default_var=",".join(DEFAULT_BINANCE_SYMBOLS))
         symbols = [s.strip() for s in symbols_raw.split(",") if s.strip()]
         interval = Variable.get("BINANCE_INTERVAL", default_var=DEFAULT_BINANCE_INTERVAL)
@@ -80,6 +78,7 @@ def api_ingestion():
 
         stats = {"symbols_processed": 0, "total_candles": 0, "files_created": []}
 
+        # Airflow Variable name used to store the last closed candle for this (symbol, interval)
         def checkpoint_key(symbol: str, interval_value: str) -> str:
             sym = re.sub(r"[^A-Za-z0-9]+", "_", symbol).strip("_")
             itv = re.sub(r"[^A-Za-z0-9]+", "_", interval_value).strip("_")
@@ -97,6 +96,7 @@ def api_ingestion():
                 last_written_close_ms: int | None = None
                 max_pages = 1000
 
+                # First run writes a fresh file; later runs append new candles
                 mode = "a" if start_time_ms is not None else "w"
                 with output_file.open(mode, encoding="utf-8") as f:
                     for _ in range(max_pages):
@@ -115,9 +115,11 @@ def api_ingestion():
                             if len(kline) < 7:
                                 continue
                             close_time_ms = int(kline[6])
-                            # Don't checkpoint / persist an open candle.
+
+                            # Skip the still-open candle (Binance can return the current forming one)
                             if close_time_ms > now_ms:
                                 continue
+
                             doc = {
                                 "symbol": symbol,
                                 "interval": interval,
@@ -139,11 +141,14 @@ def api_ingestion():
                             total_new += 1
                             last_written_close_ms = close_time_ms
 
+                        # Move the window forward based on the last candle we actually wrote
                         if last_written_close_ms is not None:
                             start_time_ms = last_written_close_ms + 1
                         else:
-                            # Only open candles returned; wait for the next run.
+                            # If we only saw an open candle, there's nothing to checkpoint yet
                             break
+
+                        # If Binance returned less than "limit", we're basically caught up
                         if len(klines) < limit:
                             break
 
@@ -160,6 +165,7 @@ def api_ingestion():
                 print(f"✗ Binance API-Fehler für {symbol}: {e}")
                 continue
 
+        # If nothing worked, mark as skipped so the DAG run doesn't look like a failure
         if stats["symbols_processed"] == 0:
             raise AirflowSkipException("Keine Binance-Daten abgerufen (API-Fehler oder kein API-Key)")
 
@@ -167,16 +173,14 @@ def api_ingestion():
 
     @task
     def fetch_etherscan_blocks(ds: str) -> Dict[str, Any]:
-        """
-        Fetches Ethereum block data from Etherscan (incremental).
-        Uses ETHERSCAN_LAST_BLOCK (Airflow Variable) as a checkpoint.
-        """
+        # Fetch Ethereum blocks via Etherscan, incremental.
+        # Checkpoint: ETHERSCAN_LAST_BLOCK (stored as an Airflow Variable).
         api_key = Variable.get("ETHERSCAN_API_KEY", default_var="")
         if not api_key or api_key == "***":
             raise AirflowSkipException("ETHERSCAN_API_KEY nicht konfiguriert - überspringe API-Aufruf")
 
         try:
-            # Fetch latest block number
+            # Latest block number (hex)
             response = requests.get(
                 ETHERSCAN_API_URL,
                 params={
@@ -203,6 +207,8 @@ def api_ingestion():
                 ) from e
 
             last_done = Variable.get("ETHERSCAN_LAST_BLOCK", default_var=None)
+
+            # First run: just grab the last N blocks so we have *something*
             if last_done is None:
                 start_block = max(0, latest_block - ETHERSCAN_FALLBACK_LAST_N_BLOCKS + 1)
             else:
@@ -227,9 +233,12 @@ def api_ingestion():
                         "apikey": api_key,
                     }
                     resp = requests.get(ETHERSCAN_API_URL, params=params, timeout=60)
+
+                    # Quick retry on rate-limit
                     if resp.status_code == 429:
                         time.sleep(1.0)
                         resp = requests.get(ETHERSCAN_API_URL, params=params, timeout=60)
+
                     resp.raise_for_status()
                     payload = resp.json()
 
@@ -244,6 +253,7 @@ def api_ingestion():
                     blocks_fetched += 1
                     time.sleep(ETHERSCAN_REQ_PAUSE_SEC)
 
+            # We checkpoint the latest chain head we saw (not "last written block")
             Variable.set("ETHERSCAN_LAST_BLOCK", str(latest_block))
 
             print(f"✓ Etherscan: {blocks_fetched} Blöcke ({start_block}..{latest_block}) → {output_file}")
@@ -259,15 +269,12 @@ def api_ingestion():
 
     @task
     def fetch_coinmarketcap_data(ds: str) -> Dict[str, Any]:
-        """
-        Fetches CoinMarketCap data.
-        Ensures per-minute snapshots without Airflow catchup:
-        - Uses COINMARKETCAP_LAST_MINUTE_UTC as a checkpoint (ISO timestamp, minute precision).
-        - On first run (no checkpoint), backfills COINMARKETCAP_BACKFILL_MINUTES minutes (default 0).
-        - On subsequent runs, fetches missing minutes since the checkpoint (capped by COINMARKETCAP_MAX_CATCHUP_MINUTES).
-        Skips if the API key is missing/invalid.
-        """
-        # Prefer env to avoid stale DB Variables in local dev (AIRFLOW_VAR_* is an Airflow convention)
+        # CoinMarketCap snapshots.
+        # Goal: get one snapshot per minute (no Airflow catchup), using a minute-level checkpoint in UTC.
+        # We try the historical endpoint first; if the key/plan doesn't allow it, we fall back to listings/latest.
+        #
+        # Checkpoint: COINMARKETCAP_LAST_MINUTE_UTC (ISO string, minute precision).
+        # First run can optionally backfill a few minutes (COINMARKETCAP_BACKFILL_MINUTES).
         api_key = (
             os.getenv("COINMARKETCAP_API_KEY")
             or os.getenv("AIRFLOW_VAR_COINMARKETCAP_API_KEY")
@@ -302,7 +309,9 @@ def api_ingestion():
                 except Exception:
                     checkpoint_minute = None
 
+            # Fetch up to "last full minute" to avoid partial minute snapshots
             end_minute = pendulum.now("UTC").subtract(minutes=1).start_of("minute")
+
             if checkpoint_minute is None:
                 start_minute = (
                     end_minute.subtract(minutes=max(0, initial_backfill_minutes - 1))
@@ -329,7 +338,7 @@ def api_ingestion():
             crypto_count = 0
             last_success_minute: pendulum.DateTime | None = None
 
-            # Try historical per-minute snapshots; if the plan/key forbids it (403), fall back to `listings/latest`.
+            # historical = per-minute snapshots, latest = one snapshot
             mode = str(Variable.get("COINMARKETCAP_MODE", default_var="historical")).strip().lower()
             if mode not in {"historical", "latest"}:
                 mode = "historical"
@@ -342,6 +351,7 @@ def api_ingestion():
                 out_dir.mkdir(parents=True, exist_ok=True)
                 out_file = out_dir / f"listings_{minute_label}.json"
 
+                # If it's already there, don't redo work
                 if out_file.exists():
                     last_success_minute = minute
                     continue
@@ -358,7 +368,7 @@ def api_ingestion():
                     except requests.exceptions.HTTPError:
                         status = getattr(resp, "status_code", None)
                         if status in {401, 403}:
-                            # Typically means: invalid key (401) or key has no access to historical endpoint (403)
+                            # No access to historical endpoint (or invalid key) -> do one "latest" snapshot and stop.
                             mode = "latest"
                             minute = end_minute
                             minute_ds = minute.to_date_string()
@@ -388,6 +398,7 @@ def api_ingestion():
                 files_created.append(str(out_file))
                 last_success_minute = minute
 
+            # Small "did we get data?" metric for the summary
             if last_success_minute is not None:
                 last_file = (
                     COINMARKETCAP_OUTPUT_DIR
@@ -420,7 +431,7 @@ def api_ingestion():
 
     @task(trigger_rule="all_done")
     def log_summary(binance: Dict[str, Any], etherscan: Dict[str, Any], cmc: Dict[str, Any]) -> None:
-        """Logs a summary of the API calls."""
+        # Just print what happened, even if some tasks got skipped.
         print("=" * 60)
         print("API Ingestion Summary:")
         print("=" * 60)

@@ -16,6 +16,7 @@ from airflow.models import Variable
 
 from pipeline_datasets import DW_DATASET
 
+# Default connection/settings. Most of this can be overridden via Airflow Variables.
 DEFAULT_PG_HOST = "postgres-data"
 DEFAULT_PG_PORT = 5432
 DEFAULT_PG_DB = "datadb"
@@ -51,6 +52,7 @@ class Settings:
 
 
 def _pg_connect(settings: Settings):
+    # Use psycopg2 if available, fallback to psycopg.
     try:
         import psycopg2  # type: ignore
 
@@ -85,34 +87,26 @@ def _pg_connect(settings: Settings):
 def pipeline_4_analytics():
     @task
     def get_settings() -> Dict[str, Any]:
+        # Pull everything from Variables first, then normalize + validate.
         pg_host = Variable.get("DW_PG_HOST", default_var=DEFAULT_PG_HOST)
         pg_port_raw = Variable.get("DW_PG_PORT", default_var=str(DEFAULT_PG_PORT))
         pg_db = Variable.get("DW_PG_DB", default_var=DEFAULT_PG_DB)
         pg_user = Variable.get("DW_PG_USER", default_var=DEFAULT_PG_USER)
         pg_password = Variable.get("DW_PG_PASSWORD", default_var=DEFAULT_PG_PASSWORD)
 
-        lookback_days_raw = Variable.get(
-            "ANALYSIS_LOOKBACK_DAYS", default_var=str(DEFAULT_LOOKBACK_DAYS)
-        )
-        asset_symbol = Variable.get(
-            "ANALYSIS_ASSET_SYMBOL", default_var=DEFAULT_ASSET_SYMBOL
-        )
-        binance_interval = Variable.get(
-            "ANALYSIS_BINANCE_INTERVAL", default_var=DEFAULT_BINANCE_INTERVAL
-        )
-        exchange_name = Variable.get(
-            "ANALYSIS_EXCHANGE_NAME", default_var=DEFAULT_EXCHANGE_NAME
-        )
+        lookback_days_raw = Variable.get("ANALYSIS_LOOKBACK_DAYS", default_var=str(DEFAULT_LOOKBACK_DAYS))
+        asset_symbol = Variable.get("ANALYSIS_ASSET_SYMBOL", default_var=DEFAULT_ASSET_SYMBOL)
+        binance_interval = Variable.get("ANALYSIS_BINANCE_INTERVAL", default_var=DEFAULT_BINANCE_INTERVAL)
+        exchange_name = Variable.get("ANALYSIS_EXCHANGE_NAME", default_var=DEFAULT_EXCHANGE_NAME)
         chain_name = Variable.get("ANALYSIS_CHAIN_NAME", default_var=DEFAULT_CHAIN_NAME)
         output_dir = Variable.get("ANALYSIS_OUTPUT_DIR", default_var=DEFAULT_OUTPUT_DIR)
-        cmc_base_symbol = Variable.get(
-            "ANALYSIS_CMC_BASE_SYMBOL", default_var=DEFAULT_CMC_BASE_SYMBOL
-        )
+        cmc_base_symbol = Variable.get("ANALYSIS_CMC_BASE_SYMBOL", default_var=DEFAULT_CMC_BASE_SYMBOL)
 
         try:
             pg_port = int(pg_port_raw)
         except ValueError:
             pg_port = DEFAULT_PG_PORT
+
         try:
             lookback_days = max(1, int(lookback_days_raw))
         except ValueError:
@@ -136,6 +130,7 @@ def pipeline_4_analytics():
 
     @task
     def run_coinmarketcap_analysis(settings_dict: Dict[str, Any]) -> Dict[str, Any]:
+        # Materializes a "top N by market cap" snapshot from the latest metric per crypto.
         settings = Settings(**settings_dict)
         conn = _pg_connect(settings)
         try:
@@ -252,6 +247,7 @@ def pipeline_4_analytics():
 
     @task
     def run_integrated_daily_analysis(settings_dict: Dict[str, Any]) -> Dict[str, Any]:
+        # Joins daily slices from CMC, Binance and Ethereum into one daily table.
         settings = Settings(**settings_dict)
         base_symbol = settings.cmc_base_symbol or DEFAULT_CMC_BASE_SYMBOL
 
@@ -403,6 +399,7 @@ def pipeline_4_analytics():
 
     @task
     def run_analysis(settings_dict: Dict[str, Any]) -> Dict[str, Any]:
+        # Builds an hourly-ish table (10-min buckets) and stores correlation results for the run window.
         settings = Settings(**settings_dict)
         conn = _pg_connect(settings)
         try:
@@ -540,7 +537,12 @@ def pipeline_4_analytics():
                       %(n_hours)s, %(corr_price_val)s, %(corr_volume_val)s
                     )
                     """,
-                    {**params, "n_hours": n_hours, "corr_price_val": corr_price_val, "corr_volume_val": corr_volume_val},
+                    {
+                        **params,
+                        "n_hours": n_hours,
+                        "corr_price_val": corr_price_val,
+                        "corr_volume_val": corr_volume_val,
+                    },
                 )
             conn.commit()
 
@@ -560,6 +562,7 @@ def pipeline_4_analytics():
 
     @task
     def create_plot(settings_dict: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
+        # Generates a PNG chart for the run window and stores it on disk.
         settings = Settings(**settings_dict)
         conn = _pg_connect(settings)
         try:
@@ -580,9 +583,7 @@ def pipeline_4_analytics():
                 rows = cur.fetchall() or []
 
             if len(rows) < 3:
-                raise AirflowSkipException(
-                    f"Not enough data points to create plot (n={len(rows)})."
-                )
+                raise AirflowSkipException(f"Not enough data points to create plot (n={len(rows)}).")
 
             try:
                 import matplotlib
@@ -596,9 +597,7 @@ def pipeline_4_analytics():
             hour_ts = [r[0] for r in rows]
             price = [float(r[1]) if r[1] is not None else float("nan") for r in rows]
             volume = [float(r[2]) if r[2] is not None else float("nan") for r in rows]
-            base_fee = [
-                float(r[3]) if r[3] is not None else float("nan") for r in rows
-            ]
+            base_fee = [float(r[3]) if r[3] is not None else float("nan") for r in rows]
 
             out_dir = Path(settings.output_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -610,7 +609,7 @@ def pipeline_4_analytics():
             corr_price = result.get("corr_price_vs_base_fee_gwei")
             corr_volume = result.get("corr_volume_vs_base_fee_gwei")
 
-            # (1) Price vs Base Fee - Time series
+            # (1) Price vs base fee (time series)
             ax1 = fig.add_subplot(2, 2, 1)
             ax1.plot(hour_ts, price, color="tab:blue", linewidth=1.2, label="ETH close (USDT)")
             ax1.set_ylabel("ETH close (USDT)", color="tab:blue")
@@ -623,7 +622,7 @@ def pipeline_4_analytics():
             ax1b.set_ylabel("Base fee (gwei)", color="tab:orange")
             ax1b.tick_params(axis="y", labelcolor="tab:orange")
 
-            # (2) Volume vs Base Fee - Time series
+            # (2) Volume vs base fee (time series)
             ax2 = fig.add_subplot(2, 2, 2)
             ax2.plot(hour_ts, volume, color="tab:green", linewidth=1.2, label="Volume (USDT)")
             ax2.set_ylabel("Volume (USDT)", color="tab:green")
@@ -636,7 +635,7 @@ def pipeline_4_analytics():
             ax2b.set_ylabel("Base fee (gwei)", color="tab:orange")
             ax2b.tick_params(axis="y", labelcolor="tab:orange")
 
-            # (3) Price vs Base Fee - Scatter
+            # (3) Price vs base fee (scatter)
             ax3 = fig.add_subplot(2, 2, 3)
             ax3.scatter(base_fee, price, s=20, alpha=0.6, color="tab:blue")
             ax3.set_xlabel("Avg base fee (gwei)")
@@ -651,7 +650,7 @@ def pipeline_4_analytics():
                 x_line = np.linspace(x_price[mask_price].min(), x_price[mask_price].max(), 100)
                 ax3.plot(x_line, m * x_line + b, color="black", linewidth=1.2, alpha=0.8)
 
-            # (4) Volume vs Base Fee - Scatter
+            # (4) Volume vs base fee (scatter)
             ax4 = fig.add_subplot(2, 2, 4)
             ax4.scatter(base_fee, volume, s=20, alpha=0.6, color="tab:green")
             ax4.set_xlabel("Avg base fee (gwei)")
@@ -681,6 +680,7 @@ def pipeline_4_analytics():
         cmc_result: Dict[str, Any],
         integrated_result: Dict[str, Any],
     ) -> None:
+        # Keep the final log as a single line so it’s easy to grep in Airflow logs.
         print(
             f"analysis_eth_price_vs_gas_fee: {result} | plot: {plot_result} | cmc: {cmc_result} | integrated: {integrated_result}"
         )
@@ -688,8 +688,11 @@ def pipeline_4_analytics():
     settings = get_settings()
     result = run_analysis(settings)
     plot_result = create_plot(settings, result)
+
+    # These are independent of the ETH price vs gas fee correlation, but useful for dashboards.
     cmc_result = run_coinmarketcap_analysis(settings)
     integrated_result = run_integrated_daily_analysis(settings)
+
     log_summary(result, plot_result, cmc_result, integrated_result)
 
 

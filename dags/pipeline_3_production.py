@@ -1,3 +1,17 @@
+"""
+Pipeline 3: Production / Data Warehouse (Star Schema)
+
+Reads cleaned data from the staging schema and loads it into a star-schema in `dw`.
+Main idea:
+- keep dimensions (time, assets, intervals, chain/exchange, crypto)
+- write facts for candles, blocks, and market snapshots
+- use checkpoints so each run is incremental
+
+Sources:
+- staging.binance_candles -> dw.fact_binance_candle
+- staging.ethereum_blocks -> dw.fact_ethereum_block
+- staging.cryptocurrencies + staging.crypto_metrics -> dw.dim_crypto + dw.fact_crypto_market_snapshot
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -36,12 +50,14 @@ DEFAULT_BATCH_SIZE_CANDLES = 2000
 DEFAULT_BATCH_SIZE_BLOCKS = 500
 DEFAULT_BATCH_SIZE_CMC = 2000
 
+# Checkpoints for incremental loads
 CHECKPOINT_BINANCE_VAR = "DW_LAST_BINANCE_STAGING_AT"
 CHECKPOINT_ETHERSCAN_VAR = "DW_LAST_ETHERSCAN_STAGING_AT"
 CHECKPOINT_CMC_VAR = "DW_LAST_CMC_METRICS_ID"
 
 
 def _pg_connect(settings: "Settings"):
+    # Small helper to open a PG connection. psycopg2 in prod, psycopg fallback locally.
     try:
         import psycopg2  # type: ignore
 
@@ -65,11 +81,13 @@ def _pg_connect(settings: "Settings"):
 
 
 def _chunks(seq: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:
+    # Basic chunker (used for batching list-based inserts).
     for idx in range(0, len(seq), size):
         yield seq[idx : idx + size]
 
 
 def _parse_hex_int(value: Any) -> Optional[int]:
+    # Accepts either "0x..." strings or plain ints/decimal strings. Returns None if it can't parse.
     if value is None:
         return None
     if isinstance(value, int):
@@ -83,6 +101,7 @@ def _parse_hex_int(value: Any) -> Optional[int]:
     return None
 
 
+# Common quote assets so we can split symbols like ETHUSDT -> (ETH, USDT)
 KNOWN_QUOTES = ["USDT", "USDC", "BUSD", "USD", "EUR", "BTC", "ETH", "BNB", "TRY"]
 
 
@@ -95,6 +114,7 @@ def _split_symbol(symbol: str) -> Tuple[Optional[str], Optional[str]]:
 
 
 def _interval_to_seconds(interval: Optional[str]) -> Optional[int]:
+    # Converts "1m", "4h", "1d", ... into seconds.
     if not interval:
         return None
     s = interval.strip().lower()
@@ -110,6 +130,7 @@ def _interval_to_seconds(interval: Optional[str]) -> Optional[int]:
 
 
 def _to_utc_dt_from_ms(ms: Any) -> Optional[datetime]:
+    # Binance uses ms timestamps.
     try:
         ms_int = int(ms)
     except (TypeError, ValueError):
@@ -118,6 +139,7 @@ def _to_utc_dt_from_ms(ms: Any) -> Optional[datetime]:
 
 
 def _to_utc_dt_from_unix_seconds(sec: Any) -> Optional[datetime]:
+    # Etherscan blocks use unix seconds.
     try:
         sec_int = int(sec)
     except (TypeError, ValueError):
@@ -126,6 +148,7 @@ def _to_utc_dt_from_unix_seconds(sec: Any) -> Optional[datetime]:
 
 
 def _time_dim_row(ts_utc: datetime) -> Tuple[Any, ...]:
+    # Builds one row for dim_time. Keep it explicit so it's easy to debug.
     # Postgres-style day-of-week: Sunday=0 .. Saturday=6
     py_weekday = ts_utc.weekday()  # Monday=0..Sunday=6
     day_of_week = (py_weekday + 1) % 7
@@ -147,6 +170,7 @@ def _time_dim_row(ts_utc: datetime) -> Tuple[Any, ...]:
 
 
 def _ensure_dw_schema(conn) -> None:
+    # Creates the DW schema + tables + base dims (exchange/chain). Safe to run every time.
     ddl = f"""
     CREATE SCHEMA IF NOT EXISTS {DW_SCHEMA};
 
@@ -280,6 +304,7 @@ def _ensure_dw_schema(conn) -> None:
     with conn.cursor() as cur:
         cur.execute(ddl)
 
+        # Seed core dimensions (idempotent).
         cur.execute(
             f"""
             INSERT INTO {DW_SCHEMA}.dim_exchange (exchange_name)
@@ -300,6 +325,7 @@ def _ensure_dw_schema(conn) -> None:
 
 
 def _fetch_one_int(cur, sql: str, params: Tuple[Any, ...]) -> int:
+    # Convenience for "SELECT something_int FROM ... WHERE ...".
     cur.execute(sql, params)
     row = cur.fetchone()
     if not row or row[0] is None:
@@ -310,6 +336,7 @@ def _fetch_one_int(cur, sql: str, params: Tuple[Any, ...]) -> int:
 def _fetch_mapping_any(
     cur, table: str, key_col: str, value_col: str, keys: Sequence[Any]
 ) -> Dict[Any, Any]:
+    # Loads a mapping {key_col -> value_col} for a set of keys using = ANY().
     if not keys:
         return {}
     cur.execute(
@@ -320,6 +347,7 @@ def _fetch_mapping_any(
 
 
 def _ensure_dim_time(conn, timestamps: Sequence[datetime], *, commit: bool = True) -> None:
+    # Inserts missing timestamps into dim_time.
     if not timestamps:
         return
     sql = f"""
@@ -337,6 +365,7 @@ def _ensure_dim_time(conn, timestamps: Sequence[datetime], *, commit: bool = Tru
 
 
 def _ensure_dim_assets(conn, symbols: Sequence[str], *, commit: bool = True) -> None:
+    # Inserts/updates assets (symbol + base/quote split when we can infer it).
     if not symbols:
         return
     sql = f"""
@@ -357,6 +386,7 @@ def _ensure_dim_assets(conn, symbols: Sequence[str], *, commit: bool = True) -> 
 
 
 def _ensure_dim_intervals(conn, intervals: Sequence[str], *, commit: bool = True) -> None:
+    # Stores interval + computed seconds (when parseable).
     if not intervals:
         return
     sql = f"""
@@ -396,21 +426,16 @@ class Settings:
 def pipeline_3_production():
     @task
     def get_settings() -> Dict[str, Any]:
+        # Read connection + batch size settings from Airflow Variables (with sane defaults).
         pg_host = Variable.get("DW_PG_HOST", default_var=DEFAULT_PG_HOST)
         pg_port_raw = Variable.get("DW_PG_PORT", default_var=str(DEFAULT_PG_PORT))
         pg_db = Variable.get("DW_PG_DB", default_var=DEFAULT_PG_DB)
         pg_user = Variable.get("DW_PG_USER", default_var=DEFAULT_PG_USER)
         pg_password = Variable.get("DW_PG_PASSWORD", default_var=DEFAULT_PG_PASSWORD)
 
-        batch_candles_raw = Variable.get(
-            "DW_BATCH_SIZE_CANDLES", default_var=str(DEFAULT_BATCH_SIZE_CANDLES)
-        )
-        batch_blocks_raw = Variable.get(
-            "DW_BATCH_SIZE_BLOCKS", default_var=str(DEFAULT_BATCH_SIZE_BLOCKS)
-        )
-        batch_cmc_raw = Variable.get(
-            "DW_BATCH_SIZE_CMC", default_var=str(DEFAULT_BATCH_SIZE_CMC)
-        )
+        batch_candles_raw = Variable.get("DW_BATCH_SIZE_CANDLES", default_var=str(DEFAULT_BATCH_SIZE_CANDLES))
+        batch_blocks_raw = Variable.get("DW_BATCH_SIZE_BLOCKS", default_var=str(DEFAULT_BATCH_SIZE_BLOCKS))
+        batch_cmc_raw = Variable.get("DW_BATCH_SIZE_CMC", default_var=str(DEFAULT_BATCH_SIZE_CMC))
 
         try:
             pg_port = int(pg_port_raw)
@@ -443,6 +468,7 @@ def pipeline_3_production():
 
     @task
     def create_dw_schema(settings_dict: Dict[str, Any]) -> None:
+        # Schema/tables + seed dims.
         settings = Settings(**settings_dict)
         conn = _pg_connect(settings)
         try:
@@ -452,6 +478,7 @@ def pipeline_3_production():
 
     @task
     def get_exchange_key(settings_dict: Dict[str, Any]) -> int:
+        # Resolve the exchange_key for Binance once and reuse it.
         settings = Settings(**settings_dict)
         conn = _pg_connect(settings)
         try:
@@ -466,6 +493,7 @@ def pipeline_3_production():
 
     @task
     def get_chain_key(settings_dict: Dict[str, Any]) -> int:
+        # Resolve the chain_key for Ethereum once and reuse it.
         settings = Settings(**settings_dict)
         conn = _pg_connect(settings)
         try:
@@ -480,24 +508,28 @@ def pipeline_3_production():
 
     @task
     def load_binance_candles(settings_dict: Dict[str, Any], exchange_key: int) -> Dict[str, Any]:
+        # Staging -> DW for Binance candles (incremental by staged_at).
         settings = Settings(**settings_dict)
         checkpoint = Variable.get(CHECKPOINT_BINANCE_VAR, default_var=None)
 
-        # Query staging table
         where_clause = ""
         params_list: List[Any] = []
         if checkpoint:
-            where_clause = f"WHERE staged_at > %s"
+            where_clause = "WHERE staged_at > %s"
             params_list.append(checkpoint)
 
         conn = _pg_connect(settings)
         try:
             stats = {"seen": 0, "inserted_or_updated": 0, "batches": 0, "checkpoint": checkpoint}
-            batch: List[Dict[str, Any]] = []
             last_staged_at: Optional[str] = checkpoint
 
             def process_batch(docs: List[Dict[str, Any]]) -> int:
+                # For each batch we:
+                # 1) ensure dims exist (assets/intervals/time)
+                # 2) map natural keys -> surrogate keys
+                # 3) upsert the facts
                 nonlocal last_staged_at
+
                 symbols = sorted({(d.get("symbol") or "").strip().upper() for d in docs if d.get("symbol")})
                 intervals = sorted({(d.get("interval") or "").strip() for d in docs if d.get("interval")})
 
@@ -509,6 +541,7 @@ def pipeline_3_production():
                         ts_set.add(ot)
                     if ct:
                         ts_set.add(ct)
+
                     sa = d.get("staged_at")
                     if sa:
                         last_staged_at = str(sa)
@@ -519,9 +552,7 @@ def pipeline_3_production():
 
                 with conn.cursor() as cur:
                     asset_map = _fetch_mapping_any(cur, "dim_asset", "symbol", "asset_key", symbols)
-                    interval_map = _fetch_mapping_any(
-                        cur, "dim_interval", "interval", "interval_key", intervals
-                    )
+                    interval_map = _fetch_mapping_any(cur, "dim_interval", "interval", "interval_key", intervals)
                     time_map = _fetch_mapping_any(cur, "dim_time", "ts_utc", "time_key", list(ts_set))
 
                     rows: List[Tuple[Any, ...]] = []
@@ -532,6 +563,7 @@ def pipeline_3_production():
                         ct = _to_utc_dt_from_ms(d.get("close_time_ms"))
                         if not symbol or not interval or not ot or not ct:
                             continue
+
                         asset_key = asset_map.get(symbol)
                         interval_key = interval_map.get(interval)
                         open_time_key = time_map.get(ot)
@@ -606,7 +638,7 @@ def pipeline_3_production():
                     conn.commit()
                     return len(rows)
 
-            # Read data from staging table
+            # Stream from staging with fetchmany so we don't load everything into memory.
             with conn.cursor() as cur:
                 query = f"""
                 SELECT
@@ -625,10 +657,11 @@ def pipeline_3_production():
                     rows = cur.fetchmany(settings.batch_candles)
                     if not rows:
                         break
-                    batch = []
+
+                    docs: List[Dict[str, Any]] = []
                     for row in rows:
                         stats["seen"] += 1
-                        batch.append(
+                        docs.append(
                             {
                                 "symbol": row[0],
                                 "interval": row[1],
@@ -649,38 +682,38 @@ def pipeline_3_production():
                                 "staged_at": row[16],
                             }
                         )
-                    stats["inserted_or_updated"] += process_batch(batch)
+
+                    stats["inserted_or_updated"] += process_batch(docs)
                     stats["batches"] += 1
 
             if stats["inserted_or_updated"] == 0:
                 raise AirflowSkipException("Keine neuen/validen Binance-Candles zum Laden gefunden.")
 
             stats["new_checkpoint"] = last_staged_at
-
             return stats
         finally:
             conn.close()
 
     @task
     def load_etherscan_blocks(settings_dict: Dict[str, Any], chain_key: int) -> Dict[str, Any]:
+        # Staging -> DW for Ethereum blocks (incremental by staged_at).
         settings = Settings(**settings_dict)
         checkpoint = Variable.get(CHECKPOINT_ETHERSCAN_VAR, default_var=None)
 
-        # Query staging table
         where_clause = ""
         params_list: List[Any] = []
         if checkpoint:
-            where_clause = f"WHERE staged_at > %s"
+            where_clause = "WHERE staged_at > %s"
             params_list.append(checkpoint)
 
         conn = _pg_connect(settings)
         try:
             stats = {"seen": 0, "inserted_or_updated": 0, "batches": 0, "checkpoint": checkpoint}
-            batch: List[Dict[str, Any]] = []
             last_staged_at: Optional[str] = checkpoint
 
             def process_batch(docs: List[Dict[str, Any]]) -> int:
                 nonlocal last_staged_at
+
                 ts_set = set()
                 for d in docs:
                     bt = _to_utc_dt_from_unix_seconds(d.get("timestamp_unix"))
@@ -767,7 +800,6 @@ def pipeline_3_production():
                     conn.commit()
                     return len(rows)
 
-            # Read data from staging table
             with conn.cursor() as cur:
                 query = f"""
                 SELECT
@@ -786,10 +818,11 @@ def pipeline_3_production():
                     rows = cur.fetchmany(settings.batch_blocks)
                     if not rows:
                         break
-                    batch = []
+
+                    docs: List[Dict[str, Any]] = []
                     for row in rows:
                         stats["seen"] += 1
-                        batch.append(
+                        docs.append(
                             {
                                 "block_hash": row[0],
                                 "block_number": row[1],
@@ -807,20 +840,21 @@ def pipeline_3_production():
                                 "staged_at": row[13],
                             }
                         )
-                    stats["inserted_or_updated"] += process_batch(batch)
+
+                    stats["inserted_or_updated"] += process_batch(docs)
                     stats["batches"] += 1
 
             if stats["inserted_or_updated"] == 0:
                 raise AirflowSkipException("Keine neuen/validen Etherscan-Blöcke zum Laden gefunden.")
 
             stats["new_checkpoint"] = last_staged_at
-
             return stats
         finally:
             conn.close()
 
     @task
     def update_binance_checkpoint(stats: Dict[str, Any]) -> Dict[str, Any]:
+        # Store the latest staged_at we processed for Binance.
         previous = stats.get("checkpoint")
         new_val = stats.get("new_checkpoint")
         if new_val and new_val != previous:
@@ -830,6 +864,7 @@ def pipeline_3_production():
 
     @task
     def update_etherscan_checkpoint(stats: Dict[str, Any]) -> Dict[str, Any]:
+        # Store the latest staged_at we processed for Ethereum.
         previous = stats.get("checkpoint")
         new_val = stats.get("new_checkpoint")
         if new_val and new_val != previous:
@@ -839,6 +874,7 @@ def pipeline_3_production():
 
     @task
     def load_coinmarketcap_metrics(settings_dict: Dict[str, Any]) -> Dict[str, Any]:
+        # Staging -> DW for CoinMarketCap metrics (checkpoint by staging.crypto_metrics.id).
         settings = Settings(**settings_dict)
         checkpoint_raw = Variable.get(CHECKPOINT_CMC_VAR, default_var="0")
         try:
@@ -849,6 +885,7 @@ def pipeline_3_production():
         conn = _pg_connect(settings)
         try:
             with conn.cursor() as cur:
+                # Quick guard: if staging tables aren't there, skip rather than failing the whole DAG.
                 cur.execute("SELECT to_regclass(%s)", (f"{STAGING_SCHEMA}.crypto_metrics",))
                 metrics_reg = cur.fetchone()[0]
                 cur.execute("SELECT to_regclass(%s)", (f"{STAGING_SCHEMA}.cryptocurrencies",))
@@ -914,6 +951,7 @@ def pipeline_3_production():
                         if not symbol or not name or not isinstance(recorded_at, datetime):
                             continue
 
+                        # Force timezone-aware UTC timestamps for dim_time mapping.
                         if recorded_at.tzinfo is None:
                             ts_utc = recorded_at.replace(tzinfo=timezone.utc)
                         else:
@@ -1032,6 +1070,7 @@ def pipeline_3_production():
 
     @task
     def update_coinmarketcap_checkpoint(stats: Dict[str, Any]) -> Dict[str, Any]:
+        # Store the last processed metric id (staging.crypto_metrics.id).
         previous = stats.get("checkpoint_id")
         new_val = stats.get("new_checkpoint_id")
         try:
@@ -1042,6 +1081,7 @@ def pipeline_3_production():
             new_int = int(new_val) if new_val is not None else prev_int
         except (TypeError, ValueError):
             new_int = prev_int
+
         if new_int > prev_int:
             Variable.set(CHECKPOINT_CMC_VAR, str(new_int))
             return {"checkpoint_id": new_int}
@@ -1056,6 +1096,7 @@ def pipeline_3_production():
         cmc_stats: Dict[str, Any],
         cmc_checkpoint: Dict[str, Any],
     ) -> None:
+        # Final log output so you can quickly see what moved this run.
         print("=" * 60)
         print("Pipeline 3 (Production / Data Warehouse) Summary:")
         print("=" * 60)

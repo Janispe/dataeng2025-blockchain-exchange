@@ -5,14 +5,14 @@ import utils
 
 
 st.set_page_config(
-    page_title="ETH Price vs Gas Fee Analysis",
+    page_title="BlocFlow",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("📊 ETH Price vs Gas Fee Correlation Analysis")
-st.markdown("Interactive dashboard for analyzing the correlation between Ethereum price (Binance) and on-chain gas fees (Base Fee)")
+st.title("📊 Cripto Analysis")
+st.markdown("Interactive dashboard for analyzing the correlation between Ethereum price and on-chain gas fees")
 
 
 def main():

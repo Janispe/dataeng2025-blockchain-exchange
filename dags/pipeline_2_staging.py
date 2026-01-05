@@ -1,18 +1,17 @@
 """
-Pipeline 2: Staging Zone
-=========================
-Loads data from the landing zone, cleans and validates it, and stores it in the staging zone.
+Pipeline 2: Staging zone
 
-Data flow:
-- MongoDB (binance_candles) → Postgres staging.binance_candles
-- MongoDB (etherscan_blocks) → Postgres staging.ethereum_blocks
-- Postgres (landing_coinmarketcap_raw) → Postgres staging_cryptocurrencies + staging_crypto_metrics
+Takes data from the landing zone, does basic cleanup/validation, and writes it into the staging schema.
 
-Cleaning:
-- Remove null values
-- Validate data types
-- Hex → integer conversion
-- Symbol normalization (uppercase)
+Flow:
+- MongoDB (binance_candles) -> Postgres staging.binance_candles
+- MongoDB (etherscan_blocks) -> Postgres staging.ethereum_blocks
+- Postgres (landing_coinmarketcap_raw) -> Postgres staging.cryptocurrencies + staging.crypto_metrics
+
+Cleanup rules:
+- Drop obviously broken rows
+- Normalize symbols (uppercase)
+- Convert hex fields to ints where needed
 """
 from __future__ import annotations
 
@@ -57,13 +56,15 @@ DEFAULT_LANDING_PG_PASSWORD = "airflow"
 STAGING_SCHEMA = "staging"
 DEFAULT_BATCH_SIZE = 1000
 
+# Checkpoints so we don't re-process the whole world every run
 CHECKPOINT_BINANCE_VAR = "STAGING_LAST_BINANCE_INGESTED_AT"
 CHECKPOINT_ETHERSCAN_VAR = "STAGING_LAST_ETHERSCAN_INGESTED_AT"
 CHECKPOINT_CMC_VAR = "STAGING_LAST_CMC_ID"
 
 
 def _pg_connect_staging():
-    """PostgreSQL connection for the staging zone (postgres-data)."""
+    # Postgres connection for the staging DB (postgres-data).
+    # Try psycopg2 first, then fallback to psycopg.
     try:
         import psycopg2  # type: ignore
 
@@ -87,7 +88,7 @@ def _pg_connect_staging():
 
 
 def _pg_connect_landing():
-    """PostgreSQL connection for the landing zone (Airflow Postgres)."""
+    # Postgres connection for the landing DB (Airflow Postgres). Used only for CoinMarketCap raw.
     try:
         import psycopg2  # type: ignore
 
@@ -111,7 +112,7 @@ def _pg_connect_landing():
 
 
 def _parse_hex_int(value: Any) -> Optional[int]:
-    """Parse hex or decimal integer values"""
+    # Accepts either "0x..." or a plain decimal string/int. Returns None if it's junk.
     if value is None:
         return None
     if isinstance(value, int):
@@ -137,19 +138,22 @@ def _parse_hex_int(value: Any) -> Optional[int]:
 def pipeline_2_staging():
     @task
     def get_binance_checkpoint() -> Optional[str]:
+        # Last processed timestamp for Binance docs (string timestamp stored by previous run).
         return Variable.get(CHECKPOINT_BINANCE_VAR, default_var=None)
 
     @task
     def get_etherscan_checkpoint() -> Optional[str]:
+        # Last processed timestamp for Ethereum block docs.
         return Variable.get(CHECKPOINT_ETHERSCAN_VAR, default_var=None)
 
     @task
     def get_coinmarketcap_checkpoint_id() -> int:
+        # Last processed landing row id for CoinMarketCap.
         return int(Variable.get(CHECKPOINT_CMC_VAR, default_var="0"))
 
     @task
     def create_staging_schema() -> None:
-        """Creates the staging schema and all tables."""
+        # Creates schema + tables if they don't exist (safe to run every time).
         conn = _pg_connect_staging()
         try:
             ddl = f"""
@@ -240,7 +244,8 @@ def pipeline_2_staging():
 
     @task
     def stage_binance_candles(checkpoint: Optional[str]) -> Dict[str, Any]:
-        """Binance: MongoDB → Postgres staging with cleaning."""
+        # Binance: MongoDB -> Postgres staging.
+        # Uses updated_at/ingested_at checkpoint so we only move "new-ish" docs.
         query: Dict[str, Any] = {}
         if checkpoint:
             query = {"$or": [{"updated_at": {"$gt": checkpoint}}, {"ingested_at": {"$gt": checkpoint}}]}
@@ -264,7 +269,6 @@ def pipeline_2_staging():
             for doc in cursor:
                 stats["seen"] += 1
 
-                # Cleaning and validation
                 try:
                     symbol = (doc.get("symbol") or "").strip().upper()
                     interval = (doc.get("interval") or "").strip()
@@ -272,17 +276,17 @@ def pipeline_2_staging():
                     close_time_ms = doc.get("close_time_ms")
                     close_price = doc.get("close")
 
-                    # Required fields
+                    # Must-have fields (otherwise we can't store it reliably)
                     if not symbol or not interval or open_time_ms is None or close_time_ms is None:
                         stats["invalid"] += 1
                         continue
 
-                    # Price validation
+                    # Quick sanity check: negative/zero close prices are almost always bad data
                     if close_price is not None and float(close_price) <= 0:
                         stats["invalid"] += 1
                         continue
 
-                    # Trading day parsen
+                    # trading_day comes as string sometimes
                     trading_day: Optional[date] = None
                     trading_day_raw = doc.get("trading_day")
                     if isinstance(trading_day_raw, str):
@@ -321,7 +325,6 @@ def pipeline_2_staging():
                     stats["invalid"] += 1
                     continue
 
-                # Write batch
                 if len(batch) >= batch_size:
                     stats["inserted"] += _insert_binance_batch(conn, batch)
                     batch = []
@@ -333,7 +336,6 @@ def pipeline_2_staging():
                 raise AirflowSkipException("Keine neuen Binance-Daten")
 
             stats["new_checkpoint"] = last_event_at
-
             return stats
 
         finally:
@@ -341,7 +343,7 @@ def pipeline_2_staging():
             client.close()
 
     def _insert_binance_batch(conn, batch: List[Dict[str, Any]]) -> int:
-        """Inserts a Binance batch into staging."""
+        # Inserts/updates Binance candles in bulk (idempotent thanks to ON CONFLICT).
         if not batch:
             return 0
 
@@ -371,12 +373,27 @@ def pipeline_2_staging():
           staged_at = NOW()
         """
 
-        rows = [(
-            d["symbol"], d["interval"], d["open_time_ms"], d["close_time_ms"], d["trading_day"],
-            d["open"], d["high"], d["low"], d["close"], d["volume"], d["quote_asset_volume"],
-            d["number_of_trades"], d["taker_buy_base_volume"], d["taker_buy_quote_volume"],
-            d["source_file"], d["ingested_at"]
-        ) for d in batch]
+        rows = [
+            (
+                d["symbol"],
+                d["interval"],
+                d["open_time_ms"],
+                d["close_time_ms"],
+                d["trading_day"],
+                d["open"],
+                d["high"],
+                d["low"],
+                d["close"],
+                d["volume"],
+                d["quote_asset_volume"],
+                d["number_of_trades"],
+                d["taker_buy_base_volume"],
+                d["taker_buy_quote_volume"],
+                d["source_file"],
+                d["ingested_at"],
+            )
+            for d in batch
+        ]
 
         with conn.cursor() as cur:
             cur.executemany(sql, rows)
@@ -385,7 +402,7 @@ def pipeline_2_staging():
 
     @task
     def stage_ethereum_blocks(checkpoint: Optional[str]) -> Dict[str, Any]:
-        """Ethereum: MongoDB → Postgres staging with cleaning."""
+        # Ethereum: MongoDB -> Postgres staging. Same checkpoint logic as Binance.
         query: Dict[str, Any] = {}
         if checkpoint:
             query = {"$or": [{"updated_at": {"$gt": checkpoint}}, {"ingested_at": {"$gt": checkpoint}}]}
@@ -466,7 +483,6 @@ def pipeline_2_staging():
                 raise AirflowSkipException("Keine neuen Ethereum-Blöcke")
 
             stats["new_checkpoint"] = last_event_at
-
             return stats
 
         finally:
@@ -474,7 +490,7 @@ def pipeline_2_staging():
             client.close()
 
     def _insert_ethereum_batch(conn, batch: List[Dict[str, Any]]) -> int:
-        """Inserts an Ethereum batch into staging."""
+        # Inserts/updates Ethereum blocks in bulk.
         if not batch:
             return 0
 
@@ -503,12 +519,24 @@ def pipeline_2_staging():
           staged_at = NOW()
         """
 
-        rows = [(
-            d["block_hash"], d["block_number"], d["timestamp_unix"], d["tx_count"],
-            d["miner"], d["gas_used"], d["gas_limit"], d["size_bytes"],
-            d["base_fee_per_gas"], d["blob_gas_used"], d["excess_blob_gas"],
-            d["ingestion_ds"], d["ingested_at"]
-        ) for d in batch]
+        rows = [
+            (
+                d["block_hash"],
+                d["block_number"],
+                d["timestamp_unix"],
+                d["tx_count"],
+                d["miner"],
+                d["gas_used"],
+                d["gas_limit"],
+                d["size_bytes"],
+                d["base_fee_per_gas"],
+                d["blob_gas_used"],
+                d["excess_blob_gas"],
+                d["ingestion_ds"],
+                d["ingested_at"],
+            )
+            for d in batch
+        ]
 
         with conn.cursor() as cur:
             cur.executemany(sql, rows)
@@ -517,7 +545,8 @@ def pipeline_2_staging():
 
     @task
     def stage_coinmarketcap(checkpoint_id: int) -> Dict[str, Any]:
-        """CoinMarketCap: Postgres landing → Postgres staging with cleaning."""
+        # CoinMarketCap: landing (Airflow Postgres) -> staging (postgres-data).
+        # Checkpoint is an auto-increment id from landing_coinmarketcap_raw.
         import json
 
         landing_conn = _pg_connect_landing()
@@ -533,7 +562,7 @@ def pipeline_2_staging():
         }
 
         try:
-            # Ensure landing table exists (pipeline_1 might have been skipped)
+            # Just in case pipeline_1 didn't run yet, ensure the landing table exists
             with landing_conn.cursor() as cur:
                 cur.execute(
                     """
@@ -549,7 +578,7 @@ def pipeline_2_staging():
                 )
             landing_conn.commit()
 
-            # Fetch newest data from landing
+            # Grab everything after the last checkpoint
             with landing_conn.cursor() as cur:
                 cur.execute(
                     """
@@ -558,7 +587,7 @@ def pipeline_2_staging():
                     WHERE id > %s
                     ORDER BY id
                     """,
-                    (checkpoint_id,)
+                    (checkpoint_id,),
                 )
                 rows = cur.fetchall()
 
@@ -586,10 +615,12 @@ def pipeline_2_staging():
                             "quote": crypto["quote"]["USD"],
                         }
 
+                        # Must-have fields
                         if not cleaned["crypto_id"] or not cleaned["symbol"] or not cleaned["name"]:
                             stats["invalid"] += 1
                             continue
 
+                        # Price sanity check
                         quote = cleaned["quote"]
                         if not quote.get("price") or quote.get("price") <= 0:
                             stats["invalid"] += 1
@@ -658,7 +689,6 @@ def pipeline_2_staging():
                 last_id = row_id
 
             stats["new_checkpoint_id"] = last_id
-
             return stats
 
         finally:
@@ -667,6 +697,7 @@ def pipeline_2_staging():
 
     @task
     def update_binance_checkpoint(stats: Dict[str, Any]) -> Dict[str, Any]:
+        # Persist the new checkpoint for Binance (if it actually advanced).
         previous = stats.get("checkpoint")
         new_val = stats.get("new_checkpoint")
         if new_val and new_val != previous:
@@ -676,6 +707,7 @@ def pipeline_2_staging():
 
     @task
     def update_etherscan_checkpoint(stats: Dict[str, Any]) -> Dict[str, Any]:
+        # Persist the new checkpoint for Ethereum blocks.
         previous = stats.get("checkpoint")
         new_val = stats.get("new_checkpoint")
         if new_val and new_val != previous:
@@ -685,6 +717,7 @@ def pipeline_2_staging():
 
     @task
     def update_coinmarketcap_checkpoint(stats: Dict[str, Any]) -> Dict[str, Any]:
+        # Persist the new checkpoint (landing row id).
         previous = stats.get("checkpoint_id")
         new_val = stats.get("new_checkpoint_id")
         if isinstance(new_val, int) and isinstance(previous, int) and new_val > previous:
@@ -701,7 +734,7 @@ def pipeline_2_staging():
         ethereum_checkpoint: Dict[str, Any],
         cmc_checkpoint: Dict[str, Any],
     ) -> None:
-        """Logs a summary for Pipeline 2."""
+        # Quick run summary to make debugging easier in Airflow logs.
         print("=" * 60)
         print("Pipeline 2 (Staging Zone) Summary:")
         print("=" * 60)
@@ -740,3 +773,4 @@ def pipeline_2_staging():
 
 
 pipeline_2_staging()
+
