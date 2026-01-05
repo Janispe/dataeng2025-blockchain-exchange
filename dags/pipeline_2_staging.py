@@ -129,6 +129,7 @@ def _parse_hex_int(value: Any) -> Optional[int]:
     start_date=pendulum.datetime(2025, 10, 1, tz="Europe/Paris"),
     schedule=[LANDING_DATASET],
     catchup=False,
+    max_active_runs=1,
     tags=["pipeline-2", "staging", "transformation"],
     default_args=dict(retries=2, retry_delay=pendulum.duration(minutes=2)),
     description="Pipeline 2: Lädt und bereinigt Daten von Landing → Staging Zone.",

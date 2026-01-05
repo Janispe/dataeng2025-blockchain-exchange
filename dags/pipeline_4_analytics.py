@@ -76,6 +76,7 @@ def _pg_connect(settings: Settings):
     start_date=pendulum.datetime(2025, 10, 1, tz="Europe/Paris"),
     schedule=[DW_DATASET],
     catchup=False,
+    max_active_runs=1,
     tags=["pipeline-4", "analytics", "analysis", "correlation"],
     default_args=dict(retries=2, retry_delay=pendulum.duration(minutes=2)),
     description="Pipeline 4: Analytics - Analysiert Korrelation zwischen ETH-Preis (Binance) und Gas-Gebühren (Ethereum).",
