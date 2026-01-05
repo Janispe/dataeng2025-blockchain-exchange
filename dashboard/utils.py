@@ -1,11 +1,49 @@
 import os
 import json
+from io import StringIO
+from functools import wraps
 from typing import Optional, Any
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
+
+
+def _coerce_datetime_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Best-effort conversion for timestamp/date columns after de/serialization.
+
+    Redis-cached DataFrames are stored as JSON, which can round-trip datetimes as
+    strings; this normalizes common timestamp columns back to datetime-like dtypes.
+    """
+    if df is None or df.empty:
+        return df
+
+    # Common naming patterns in this project.
+    candidate_cols = [
+        c
+        for c in df.columns
+        if isinstance(c, str)
+        and (
+            c.endswith("_ts")
+            or c.endswith("_at")
+            or c in {"hour_ts", "run_ts", "window_start", "window_end", "snapshot_ts", "trading_date"}
+        )
+    ]
+
+    for col in candidate_cols:
+        try:
+            if not pd.api.types.is_datetime64_any_dtype(df[col]):
+                converted = pd.to_datetime(df[col], errors="coerce", utc=False)
+                # Only keep the conversion if it produced at least one valid timestamp.
+                if converted.notna().any():
+                    df[col] = converted
+        except Exception:
+            # Keep original column on any conversion issues.
+            pass
+
+    return df
 
 
 @st.cache_resource
@@ -29,21 +67,35 @@ def get_redis_connection():
 def redis_cached(key_prefix: str, ttl: int = 300):
     """Redis cache decorator with fallback to Streamlit cache."""
     def decorator(func):
+        @wraps(func)
         def wrapper(*args, **kwargs):
             redis_conn = get_redis_connection()
             if redis_conn is None:
                 return func(*args, **kwargs)
 
-            # Build cache key from args
-            cache_key = f"{key_prefix}:{':'.join(str(a) for a in args if a is not None)}"
+            # Build cache key from args and kwargs (excluding _conn)
+            cache_parts = [str(a) for a in args if a is not None]
+            for k, v in sorted(kwargs.items()):
+                if not k.startswith('_') and v is not None:
+                    cache_parts.append(f"{k}={v}")
+            cache_key = f"{key_prefix}:{':'.join(cache_parts)}"
 
             try:
                 cached = redis_conn.get(cache_key)
                 if cached:
                     data = json.loads(cached)
                     if "dataframe" in data:
-                        return pd.read_json(data["dataframe"], orient="split")
-                    return data.get("result")
+                        df = pd.read_json(StringIO(data["dataframe"]), orient="split")
+                        df = _coerce_datetime_columns(df)
+                        # Backward-compat: older cached summary_stats may have been stored as a 1-row DataFrame.
+                        if key_prefix == "summary_stats" and isinstance(df, pd.DataFrame):
+                            if df.empty:
+                                return {}
+                            if len(df.index) == 1:
+                                return df.iloc[0].to_dict()
+                        return df
+                    if "result" in data:
+                        return data["result"]
             except Exception:
                 pass
 
@@ -89,8 +141,8 @@ def get_db_connection():
         )
 
 
-@st.cache_data(ttl=300)
-@redis_cached("hourly_data", ttl=180)
+@st.cache_data(ttl=120)
+@redis_cached("hourly_data", ttl=120)
 def fetch_hourly_data(
     start_date: str,
     end_date: str,
@@ -125,8 +177,8 @@ def fetch_hourly_data(
     return df
 
 
-@st.cache_data(ttl=300)
-@redis_cached("summary_stats", ttl=180)
+@st.cache_data(ttl=120)
+@redis_cached("summary_stats", ttl=120)
 def fetch_summary_stats(
     start_date: str,
     end_date: str,
@@ -163,8 +215,8 @@ def fetch_summary_stats(
     return df.iloc[0].to_dict()
 
 
-@st.cache_data(ttl=300)
-@redis_cached("historical_trends", ttl=240)
+@st.cache_data(ttl=120)
+@redis_cached("historical_trends", ttl=120)
 def fetch_historical_trends(
     lookback_runs: int = 10,
     _conn: Optional[Any] = None,

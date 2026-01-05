@@ -22,7 +22,7 @@ def main():
 
     # Default dates for sample data (adjust these to match your data range)
     default_start = datetime(2026, 1, 1).date()
-    default_end = datetime(2026, 1, 6).date()
+    default_end = datetime(2026, 1, 7).date()
 
     start_date = st.sidebar.date_input(
         "Start Date",
@@ -58,12 +58,17 @@ def main():
                 end_date=str(end_date),
                 _conn=conn,
             )
-
             summary_stats = utils.fetch_summary_stats(
                 start_date=str(start_date),
                 end_date=str(end_date),
                 _conn=conn,
             )
+            if isinstance(summary_stats, pd.DataFrame):
+                summary_stats = summary_stats.iloc[0].to_dict() if not summary_stats.empty else {}
+            elif isinstance(summary_stats, pd.Series):
+                summary_stats = summary_stats.to_dict()
+            elif summary_stats is None:
+                summary_stats = {}
 
             historical_df = utils.fetch_historical_trends(
                 lookback_runs=20,
@@ -72,6 +77,8 @@ def main():
 
         except Exception as e:
             st.error(f"Error loading data: {e}")
+            import traceback
+            st.error(traceback.format_exc())
             st.stop()
 
     if hourly_df.empty:
