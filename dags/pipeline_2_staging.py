@@ -1,18 +1,18 @@
 """
 Pipeline 2: Staging Zone
 =========================
-Lädt Daten von Landing Zone, bereinigt und validiert sie, und speichert in Staging Zone.
+Loads data from the landing zone, cleans and validates it, and stores it in the staging zone.
 
-Datenfluss:
+Data flow:
 - MongoDB (binance_candles) → Postgres staging.binance_candles
 - MongoDB (etherscan_blocks) → Postgres staging.ethereum_blocks
 - Postgres (landing_coinmarketcap_raw) → Postgres staging_cryptocurrencies + staging_crypto_metrics
 
-Bereinigung:
-- Null-Werte entfernen
-- Datentyp-Validierung
-- Hex → Integer Konvertierung
-- Symbol-Normalisierung (Uppercase)
+Cleaning:
+- Remove null values
+- Validate data types
+- Hex → integer conversion
+- Symbol normalization (uppercase)
 """
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ DEFAULT_STAGING_PG_DB = "datadb"
 DEFAULT_STAGING_PG_USER = "datauser"
 DEFAULT_STAGING_PG_PASSWORD = "datapass"
 
-# Postgres defaults - Landing DB (Airflow Postgres, für CoinMarketCap)
+# Postgres defaults - Landing DB (Airflow Postgres, for CoinMarketCap)
 DEFAULT_LANDING_PG_HOST = "postgres"
 DEFAULT_LANDING_PG_PORT = 5432
 DEFAULT_LANDING_PG_DB = "airflow"
@@ -59,7 +59,7 @@ CHECKPOINT_CMC_VAR = "STAGING_LAST_CMC_ID"
 
 
 def _pg_connect_staging():
-    """PostgreSQL-Verbindung für Staging Zone (postgres-data)"""
+    """PostgreSQL connection for the staging zone (postgres-data)."""
     try:
         import psycopg2  # type: ignore
 
@@ -83,7 +83,7 @@ def _pg_connect_staging():
 
 
 def _pg_connect_landing():
-    """PostgreSQL-Verbindung für Landing Zone (Airflow Postgres)"""
+    """PostgreSQL connection for the landing zone (Airflow Postgres)."""
     try:
         import psycopg2  # type: ignore
 
@@ -123,7 +123,7 @@ def _parse_hex_int(value: Any) -> Optional[int]:
 
 @dag(
     start_date=pendulum.datetime(2025, 10, 1, tz="Europe/Paris"),
-    schedule="*/20 * * * *",  # Alle 20 Minuten
+    schedule="*/20 * * * *",  # every 20 minutes
     catchup=False,
     tags=["pipeline-2", "staging", "transformation"],
     default_args=dict(retries=2, retry_delay=pendulum.duration(minutes=2)),
@@ -131,8 +131,20 @@ def _parse_hex_int(value: Any) -> Optional[int]:
 )
 def pipeline_2_staging():
     @task
+    def get_binance_checkpoint() -> Optional[str]:
+        return Variable.get(CHECKPOINT_BINANCE_VAR, default_var=None)
+
+    @task
+    def get_etherscan_checkpoint() -> Optional[str]:
+        return Variable.get(CHECKPOINT_ETHERSCAN_VAR, default_var=None)
+
+    @task
+    def get_coinmarketcap_checkpoint_id() -> int:
+        return int(Variable.get(CHECKPOINT_CMC_VAR, default_var="0"))
+
+    @task
     def create_staging_schema() -> None:
-        """Erstellt Staging Schema und alle Tabellen"""
+        """Creates the staging schema and all tables."""
         conn = _pg_connect_staging()
         try:
             ddl = f"""
@@ -222,9 +234,8 @@ def pipeline_2_staging():
             conn.close()
 
     @task
-    def stage_binance_candles() -> Dict[str, Any]:
-        """Binance: MongoDB → Postgres Staging mit Bereinigung"""
-        checkpoint = Variable.get(CHECKPOINT_BINANCE_VAR, default_var=None)
+    def stage_binance_candles(checkpoint: Optional[str]) -> Dict[str, Any]:
+        """Binance: MongoDB → Postgres staging with cleaning."""
         query: Dict[str, Any] = {}
         if checkpoint:
             query = {"ingested_at": {"$gt": checkpoint}}
@@ -238,7 +249,7 @@ def pipeline_2_staging():
         coll = client[mongo_db][collection_name]
         conn = _pg_connect_staging()
 
-        stats = {"seen": 0, "valid": 0, "invalid": 0, "inserted": 0}
+        stats = {"seen": 0, "valid": 0, "invalid": 0, "inserted": 0, "checkpoint": checkpoint}
         batch: List[Dict[str, Any]] = []
         last_ingested_at: Optional[str] = checkpoint
 
@@ -248,7 +259,7 @@ def pipeline_2_staging():
             for doc in cursor:
                 stats["seen"] += 1
 
-                # Bereinigung und Validierung
+                # Cleaning and validation
                 try:
                     symbol = (doc.get("symbol") or "").strip().upper()
                     interval = (doc.get("interval") or "").strip()
@@ -256,12 +267,12 @@ def pipeline_2_staging():
                     close_time_ms = doc.get("close_time_ms")
                     close_price = doc.get("close")
 
-                    # Pflichtfelder
+                    # Required fields
                     if not symbol or not interval or open_time_ms is None or close_time_ms is None:
                         stats["invalid"] += 1
                         continue
 
-                    # Preis-Validierung
+                    # Price validation
                     if close_price is not None and float(close_price) <= 0:
                         stats["invalid"] += 1
                         continue
@@ -305,7 +316,7 @@ def pipeline_2_staging():
                     stats["invalid"] += 1
                     continue
 
-                # Batch schreiben
+                # Write batch
                 if len(batch) >= batch_size:
                     stats["inserted"] += _insert_binance_batch(conn, batch)
                     batch = []
@@ -316,9 +327,7 @@ def pipeline_2_staging():
             if stats["inserted"] == 0:
                 raise AirflowSkipException("Keine neuen Binance-Daten")
 
-            if last_ingested_at and last_ingested_at != checkpoint:
-                Variable.set(CHECKPOINT_BINANCE_VAR, last_ingested_at)
-                stats["checkpoint"] = last_ingested_at
+            stats["new_checkpoint"] = last_ingested_at
 
             return stats
 
@@ -327,7 +336,7 @@ def pipeline_2_staging():
             client.close()
 
     def _insert_binance_batch(conn, batch: List[Dict[str, Any]]) -> int:
-        """Fügt Binance-Batch in Staging ein"""
+        """Inserts a Binance batch into staging."""
         if not batch:
             return 0
 
@@ -370,9 +379,8 @@ def pipeline_2_staging():
         return len(rows)
 
     @task
-    def stage_ethereum_blocks() -> Dict[str, Any]:
-        """Ethereum: MongoDB → Postgres Staging mit Bereinigung"""
-        checkpoint = Variable.get(CHECKPOINT_ETHERSCAN_VAR, default_var=None)
+    def stage_ethereum_blocks(checkpoint: Optional[str]) -> Dict[str, Any]:
+        """Ethereum: MongoDB → Postgres staging with cleaning."""
         query: Dict[str, Any] = {}
         if checkpoint:
             query = {"ingested_at": {"$gt": checkpoint}}
@@ -386,7 +394,7 @@ def pipeline_2_staging():
         coll = client[mongo_db][collection_name]
         conn = _pg_connect_staging()
 
-        stats = {"seen": 0, "valid": 0, "invalid": 0, "inserted": 0}
+        stats = {"seen": 0, "valid": 0, "invalid": 0, "inserted": 0, "checkpoint": checkpoint}
         batch: List[Dict[str, Any]] = []
         last_ingested_at: Optional[str] = checkpoint
 
@@ -452,9 +460,7 @@ def pipeline_2_staging():
             if stats["inserted"] == 0:
                 raise AirflowSkipException("Keine neuen Ethereum-Blöcke")
 
-            if last_ingested_at and last_ingested_at != checkpoint:
-                Variable.set(CHECKPOINT_ETHERSCAN_VAR, last_ingested_at)
-                stats["checkpoint"] = last_ingested_at
+            stats["new_checkpoint"] = last_ingested_at
 
             return stats
 
@@ -463,7 +469,7 @@ def pipeline_2_staging():
             client.close()
 
     def _insert_ethereum_batch(conn, batch: List[Dict[str, Any]]) -> int:
-        """Fügt Ethereum-Batch in Staging ein"""
+        """Inserts an Ethereum batch into staging."""
         if not batch:
             return 0
 
@@ -505,19 +511,40 @@ def pipeline_2_staging():
         return len(rows)
 
     @task
-    def stage_coinmarketcap() -> Dict[str, Any]:
-        """CoinMarketCap: Postgres Landing → Postgres Staging mit Bereinigung"""
+    def stage_coinmarketcap(checkpoint_id: int) -> Dict[str, Any]:
+        """CoinMarketCap: Postgres landing → Postgres staging with cleaning."""
         import json
-
-        checkpoint_id = int(Variable.get(CHECKPOINT_CMC_VAR, default_var="0"))
 
         landing_conn = _pg_connect_landing()
         staging_conn = _pg_connect_staging()
 
-        stats = {"seen": 0, "valid": 0, "invalid": 0, "cryptos_inserted": 0, "metrics_inserted": 0}
+        stats = {
+            "seen": 0,
+            "valid": 0,
+            "invalid": 0,
+            "cryptos_inserted": 0,
+            "metrics_inserted": 0,
+            "checkpoint_id": checkpoint_id,
+        }
 
         try:
-            # Hole neueste Daten aus Landing
+            # Ensure landing table exists (pipeline_1 might have been skipped)
+            with landing_conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS landing_coinmarketcap_raw (
+                        id SERIAL PRIMARY KEY,
+                        ingestion_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        api_response JSONB,
+                        status_code INTEGER,
+                        request_params JSONB,
+                        source_file TEXT
+                    );
+                    """
+                )
+            landing_conn.commit()
+
+            # Fetch newest data from landing
             with landing_conn.cursor() as cur:
                 cur.execute(
                     """
@@ -540,6 +567,9 @@ def pipeline_2_staging():
                 data = json.loads(api_response) if isinstance(api_response, str) else api_response
                 cryptocurrencies = data.get("data", [])
 
+                crypto_rows: List[Any] = []
+                metrics_rows: List[Any] = []
+
                 for crypto in cryptocurrencies:
                     try:
                         cleaned = {
@@ -560,56 +590,69 @@ def pipeline_2_staging():
                             stats["invalid"] += 1
                             continue
 
-                        # Insert Crypto
-                        with staging_conn.cursor() as cur:
-                            cur.execute(
-                                f"""
-                                INSERT INTO {STAGING_SCHEMA}.cryptocurrencies
-                                    (crypto_id, symbol, name, slug, last_updated)
-                                VALUES (%s, %s, %s, %s, %s)
-                                ON CONFLICT (crypto_id)
-                                DO UPDATE SET
-                                    symbol = EXCLUDED.symbol,
-                                    name = EXCLUDED.name,
-                                    slug = EXCLUDED.slug,
-                                    last_updated = EXCLUDED.last_updated,
-                                    processed_at = CURRENT_TIMESTAMP
-                                """,
-                                (cleaned["crypto_id"], cleaned["symbol"], cleaned["name"],
-                                 cleaned["slug"], cleaned["last_updated"])
-                            )
-                        stats["cryptos_inserted"] += 1
-
-                        # Insert Metrics
-                        with staging_conn.cursor() as cur:
-                            cur.execute(
-                                f"""
-                                INSERT INTO {STAGING_SCHEMA}.crypto_metrics
-                                    (crypto_id, price_usd, volume_24h, market_cap,
-                                     percent_change_1h, percent_change_24h, percent_change_7d,
-                                     circulating_supply, total_supply, max_supply)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                                ON CONFLICT (crypto_id, recorded_at) DO NOTHING
-                                """,
-                                (cleaned["crypto_id"], quote.get("price"), quote.get("volume_24h"),
-                                 quote.get("market_cap"), quote.get("percent_change_1h"),
-                                 quote.get("percent_change_24h"), quote.get("percent_change_7d"),
-                                 quote.get("circulating_supply"), quote.get("total_supply"),
-                                 quote.get("max_supply"))
-                            )
-                        stats["metrics_inserted"] += 1
                         stats["valid"] += 1
+                        crypto_rows.append(
+                            (
+                                cleaned["crypto_id"],
+                                cleaned["symbol"],
+                                cleaned["name"],
+                                cleaned["slug"],
+                                cleaned["last_updated"],
+                            )
+                        )
+                        metrics_rows.append(
+                            (
+                                cleaned["crypto_id"],
+                                quote.get("price"),
+                                quote.get("volume_24h"),
+                                quote.get("market_cap"),
+                                quote.get("percent_change_1h"),
+                                quote.get("percent_change_24h"),
+                                quote.get("percent_change_7d"),
+                                quote.get("circulating_supply"),
+                                quote.get("total_supply"),
+                                quote.get("max_supply"),
+                            )
+                        )
 
                     except (KeyError, TypeError):
                         stats["invalid"] += 1
                         continue
 
+                crypto_upsert_sql = f"""
+                INSERT INTO {STAGING_SCHEMA}.cryptocurrencies
+                    (crypto_id, symbol, name, slug, last_updated)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (crypto_id)
+                DO UPDATE SET
+                    symbol = EXCLUDED.symbol,
+                    name = EXCLUDED.name,
+                    slug = EXCLUDED.slug,
+                    last_updated = EXCLUDED.last_updated,
+                    processed_at = CURRENT_TIMESTAMP
+                """
+
+                metrics_insert_sql = f"""
+                INSERT INTO {STAGING_SCHEMA}.crypto_metrics
+                    (crypto_id, price_usd, volume_24h, market_cap,
+                     percent_change_1h, percent_change_24h, percent_change_7d,
+                     circulating_supply, total_supply, max_supply)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (crypto_id, recorded_at) DO NOTHING
+                """
+
+                with staging_conn.cursor() as cur:
+                    if crypto_rows:
+                        cur.executemany(crypto_upsert_sql, crypto_rows)
+                        stats["cryptos_inserted"] += len(crypto_rows)
+                    if metrics_rows:
+                        cur.executemany(metrics_insert_sql, metrics_rows)
+                        stats["metrics_inserted"] += len(metrics_rows)
+
                 staging_conn.commit()
                 last_id = row_id
 
-            if last_id > checkpoint_id:
-                Variable.set(CHECKPOINT_CMC_VAR, str(last_id))
-                stats["checkpoint_id"] = last_id
+            stats["new_checkpoint_id"] = last_id
 
             return stats
 
@@ -617,24 +660,71 @@ def pipeline_2_staging():
             landing_conn.close()
             staging_conn.close()
 
+    @task
+    def update_binance_checkpoint(stats: Dict[str, Any]) -> Dict[str, Any]:
+        previous = stats.get("checkpoint")
+        new_val = stats.get("new_checkpoint")
+        if new_val and new_val != previous:
+            Variable.set(CHECKPOINT_BINANCE_VAR, str(new_val))
+            return {"checkpoint": str(new_val)}
+        return {"checkpoint": previous}
+
+    @task
+    def update_etherscan_checkpoint(stats: Dict[str, Any]) -> Dict[str, Any]:
+        previous = stats.get("checkpoint")
+        new_val = stats.get("new_checkpoint")
+        if new_val and new_val != previous:
+            Variable.set(CHECKPOINT_ETHERSCAN_VAR, str(new_val))
+            return {"checkpoint": str(new_val)}
+        return {"checkpoint": previous}
+
+    @task
+    def update_coinmarketcap_checkpoint(stats: Dict[str, Any]) -> Dict[str, Any]:
+        previous = stats.get("checkpoint_id")
+        new_val = stats.get("new_checkpoint_id")
+        if isinstance(new_val, int) and isinstance(previous, int) and new_val > previous:
+            Variable.set(CHECKPOINT_CMC_VAR, str(new_val))
+            return {"checkpoint_id": new_val}
+        return {"checkpoint_id": previous}
+
     @task(trigger_rule="all_done")
-    def log_summary(binance: Dict[str, Any], ethereum: Dict[str, Any], cmc: Dict[str, Any]) -> None:
-        """Loggt Zusammenfassung von Pipeline 2"""
+    def log_summary(
+        binance: Dict[str, Any],
+        ethereum: Dict[str, Any],
+        cmc: Dict[str, Any],
+        binance_checkpoint: Dict[str, Any],
+        ethereum_checkpoint: Dict[str, Any],
+        cmc_checkpoint: Dict[str, Any],
+    ) -> None:
+        """Logs a summary for Pipeline 2."""
         print("=" * 60)
         print("Pipeline 2 (Staging Zone) Summary:")
         print("=" * 60)
         print(f"Binance: {binance}")
         print(f"Ethereum: {ethereum}")
         print(f"CoinMarketCap: {cmc}")
+        print(f"Binance checkpoint: {binance_checkpoint}")
+        print(f"Ethereum checkpoint: {ethereum_checkpoint}")
+        print(f"CoinMarketCap checkpoint: {cmc_checkpoint}")
         print("=" * 60)
 
     schema = create_staging_schema()
-    binance_stats = stage_binance_candles()
-    ethereum_stats = stage_ethereum_blocks()
-    cmc_stats = stage_coinmarketcap()
+    binance_cp = get_binance_checkpoint()
+    ethereum_cp = get_etherscan_checkpoint()
+    cmc_cp = get_coinmarketcap_checkpoint_id()
+
+    schema >> [binance_cp, ethereum_cp, cmc_cp]
+
+    binance_stats = stage_binance_candles(binance_cp)
+    ethereum_stats = stage_ethereum_blocks(ethereum_cp)
+    cmc_stats = stage_coinmarketcap(cmc_cp)
 
     schema >> [binance_stats, ethereum_stats, cmc_stats]
-    log_summary(binance_stats, ethereum_stats, cmc_stats)
+    binance_checkpoint = update_binance_checkpoint(binance_stats)
+    ethereum_checkpoint = update_etherscan_checkpoint(ethereum_stats)
+    cmc_checkpoint = update_coinmarketcap_checkpoint(cmc_stats)
+
+    log_summary(binance_stats, ethereum_stats, cmc_stats, binance_checkpoint, ethereum_checkpoint, cmc_checkpoint)
 
 
 pipeline_2_staging()
