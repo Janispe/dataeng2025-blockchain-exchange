@@ -118,8 +118,8 @@ flowchart LR
   end
 
   subgraph Landing
-    M[(MongoDB\nbinance_candles\netherscan_blocks\n(+ optional cmc_raw))]
-    LP[(Postgres (airflow)\nlanding_coinmarketcap_raw)]
+    M[(MongoDB\nbinance_candles\netherscan_blocks\ncmc_raw optional)]
+    LP[(Postgres airflow\nlanding_coinmarketcap_raw)]
   end
 
   subgraph Staging["Staging (postgres-data:staging)"]
