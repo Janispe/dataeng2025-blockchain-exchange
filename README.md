@@ -118,8 +118,8 @@ flowchart LR
   end
 
   subgraph Landing
-    M[(MongoDB\nbinance_candles\netherscan_blocks\n(+ optional cmc_raw))]
-    LP[(Postgres (airflow)\nlanding_coinmarketcap_raw)]
+    M[(MongoDB\nbinance_candles\netherscan_blocks\ncmc_raw optional)]
+    LP[(Postgres airflow\nlanding_coinmarketcap_raw)]
   end
 
   subgraph Staging["Staging (postgres-data:staging)"]
@@ -136,9 +136,9 @@ flowchart LR
     UI[Streamlit Dashboard]
   end
 
-  BIN -->|api_ingestion (optional)| F1
-  ETH -->|api_ingestion (optional)| F2
-  CMC -->|api_ingestion (optional)| F3
+  BIN -->|api_ingestion optional| F1
+  ETH -->|api_ingestion optional| F2
+  CMC -->|api_ingestion optional| F3
 
   F1 -->|pipeline_1_landing| M
   F2 -->|pipeline_1_landing| M
