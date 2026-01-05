@@ -279,7 +279,7 @@ def _fetch_mapping_any(
     return {k: v for (k, v) in cur.fetchall()}
 
 
-def _ensure_dim_time(conn, timestamps: Sequence[datetime]) -> None:
+def _ensure_dim_time(conn, timestamps: Sequence[datetime], *, commit: bool = True) -> None:
     if not timestamps:
         return
     sql = f"""
@@ -292,10 +292,11 @@ def _ensure_dim_time(conn, timestamps: Sequence[datetime]) -> None:
     rows = [_time_dim_row(ts) for ts in timestamps]
     with conn.cursor() as cur:
         cur.executemany(sql, rows)
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
-def _ensure_dim_assets(conn, symbols: Sequence[str]) -> None:
+def _ensure_dim_assets(conn, symbols: Sequence[str], *, commit: bool = True) -> None:
     if not symbols:
         return
     sql = f"""
@@ -311,10 +312,11 @@ def _ensure_dim_assets(conn, symbols: Sequence[str]) -> None:
         rows.append((s.strip().upper(), base, quote))
     with conn.cursor() as cur:
         cur.executemany(sql, rows)
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
-def _ensure_dim_intervals(conn, intervals: Sequence[str]) -> None:
+def _ensure_dim_intervals(conn, intervals: Sequence[str], *, commit: bool = True) -> None:
     if not intervals:
         return
     sql = f"""
@@ -326,7 +328,8 @@ def _ensure_dim_intervals(conn, intervals: Sequence[str]) -> None:
     rows = [(i, _interval_to_seconds(i)) for i in intervals]
     with conn.cursor() as cur:
         cur.executemany(sql, rows)
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 @dataclass(frozen=True)
@@ -398,11 +401,39 @@ def pipeline_3_production():
             conn.close()
 
     @task
-    def load_binance_candles(settings_dict: Dict[str, Any]) -> Dict[str, Any]:
+    def get_exchange_key(settings_dict: Dict[str, Any]) -> int:
+        settings = Settings(**settings_dict)
+        conn = _pg_connect(settings)
+        try:
+            with conn.cursor() as cur:
+                return _fetch_one_int(
+                    cur,
+                    f"SELECT exchange_key FROM {DW_SCHEMA}.dim_exchange WHERE exchange_name=%s",
+                    (BINANCE_EXCHANGE_NAME,),
+                )
+        finally:
+            conn.close()
+
+    @task
+    def get_chain_key(settings_dict: Dict[str, Any]) -> int:
+        settings = Settings(**settings_dict)
+        conn = _pg_connect(settings)
+        try:
+            with conn.cursor() as cur:
+                return _fetch_one_int(
+                    cur,
+                    f"SELECT chain_key FROM {DW_SCHEMA}.dim_chain WHERE chain_name=%s",
+                    (ETHEREUM_CHAIN_NAME,),
+                )
+        finally:
+            conn.close()
+
+    @task
+    def load_binance_candles(settings_dict: Dict[str, Any], exchange_key: int) -> Dict[str, Any]:
         settings = Settings(**settings_dict)
         checkpoint = Variable.get(CHECKPOINT_BINANCE_VAR, default_var=None)
 
-        # Query für Staging-Tabelle
+        # Query staging table
         where_clause = ""
         params_list: List[Any] = []
         if checkpoint:
@@ -411,14 +442,6 @@ def pipeline_3_production():
 
         conn = _pg_connect(settings)
         try:
-            # Hole exchange_key
-            with conn.cursor() as cur:
-                exchange_key = _fetch_one_int(
-                    cur,
-                    f"SELECT exchange_key FROM {DW_SCHEMA}.dim_exchange WHERE exchange_name=%s",
-                    (BINANCE_EXCHANGE_NAME,),
-                )
-
             stats = {"seen": 0, "inserted_or_updated": 0, "batches": 0, "checkpoint": checkpoint}
             batch: List[Dict[str, Any]] = []
             last_staged_at: Optional[str] = checkpoint
@@ -440,9 +463,9 @@ def pipeline_3_production():
                     if sa:
                         last_staged_at = str(sa)
 
-                _ensure_dim_assets(conn, symbols)
-                _ensure_dim_intervals(conn, intervals)
-                _ensure_dim_time(conn, sorted(ts_set))
+                _ensure_dim_assets(conn, symbols, commit=False)
+                _ensure_dim_intervals(conn, intervals, commit=False)
+                _ensure_dim_time(conn, sorted(ts_set), commit=False)
 
                 with conn.cursor() as cur:
                     asset_map = _fetch_mapping_any(cur, "dim_asset", "symbol", "asset_key", symbols)
@@ -533,7 +556,7 @@ def pipeline_3_production():
                     conn.commit()
                     return len(rows)
 
-            # Lese Daten von Staging-Tabelle
+            # Read data from staging table
             with conn.cursor() as cur:
                 query = f"""
                 SELECT
@@ -547,55 +570,53 @@ def pipeline_3_production():
                 """
                 cur.execute(query, params_list)
 
-                for row in cur:
-                    stats["seen"] += 1
-                    doc = {
-                        "symbol": row[0],
-                        "interval": row[1],
-                        "open_time_ms": row[2],
-                        "close_time_ms": row[3],
-                        "trading_day": row[4],
-                        "open": row[5],
-                        "high": row[6],
-                        "low": row[7],
-                        "close": row[8],
-                        "volume": row[9],
-                        "quote_asset_volume": row[10],
-                        "number_of_trades": row[11],
-                        "taker_buy_base_volume": row[12],
-                        "taker_buy_quote_volume": row[13],
-                        "source_file": row[14],
-                        "ingested_at": row[15],
-                        "staged_at": row[16],
-                    }
-                    batch.append(doc)
-
-                    if len(batch) >= settings.batch_candles:
-                        stats["inserted_or_updated"] += process_batch(batch)
-                        stats["batches"] += 1
-                        batch = []
-
-            if batch:
-                stats["inserted_or_updated"] += process_batch(batch)
-                stats["batches"] += 1
+                cur.arraysize = max(1, settings.batch_candles)
+                while True:
+                    rows = cur.fetchmany(settings.batch_candles)
+                    if not rows:
+                        break
+                    batch = []
+                    for row in rows:
+                        stats["seen"] += 1
+                        batch.append(
+                            {
+                                "symbol": row[0],
+                                "interval": row[1],
+                                "open_time_ms": row[2],
+                                "close_time_ms": row[3],
+                                "trading_day": row[4],
+                                "open": row[5],
+                                "high": row[6],
+                                "low": row[7],
+                                "close": row[8],
+                                "volume": row[9],
+                                "quote_asset_volume": row[10],
+                                "number_of_trades": row[11],
+                                "taker_buy_base_volume": row[12],
+                                "taker_buy_quote_volume": row[13],
+                                "source_file": row[14],
+                                "ingested_at": row[15],
+                                "staged_at": row[16],
+                            }
+                        )
+                    stats["inserted_or_updated"] += process_batch(batch)
+                    stats["batches"] += 1
 
             if stats["inserted_or_updated"] == 0:
                 raise AirflowSkipException("Keine neuen/validen Binance-Candles zum Laden gefunden.")
 
-            if last_staged_at and last_staged_at != checkpoint:
-                Variable.set(CHECKPOINT_BINANCE_VAR, last_staged_at)
-                stats["checkpoint"] = last_staged_at
+            stats["new_checkpoint"] = last_staged_at
 
             return stats
         finally:
             conn.close()
 
     @task
-    def load_etherscan_blocks(settings_dict: Dict[str, Any]) -> Dict[str, Any]:
+    def load_etherscan_blocks(settings_dict: Dict[str, Any], chain_key: int) -> Dict[str, Any]:
         settings = Settings(**settings_dict)
         checkpoint = Variable.get(CHECKPOINT_ETHERSCAN_VAR, default_var=None)
 
-        # Query für Staging-Tabelle
+        # Query staging table
         where_clause = ""
         params_list: List[Any] = []
         if checkpoint:
@@ -604,13 +625,6 @@ def pipeline_3_production():
 
         conn = _pg_connect(settings)
         try:
-            with conn.cursor() as cur:
-                chain_key = _fetch_one_int(
-                    cur,
-                    f"SELECT chain_key FROM {DW_SCHEMA}.dim_chain WHERE chain_name=%s",
-                    (ETHEREUM_CHAIN_NAME,),
-                )
-
             stats = {"seen": 0, "inserted_or_updated": 0, "batches": 0, "checkpoint": checkpoint}
             batch: List[Dict[str, Any]] = []
             last_staged_at: Optional[str] = checkpoint
@@ -626,7 +640,7 @@ def pipeline_3_production():
                     if sa:
                         last_staged_at = str(sa)
 
-                _ensure_dim_time(conn, sorted(ts_set))
+                _ensure_dim_time(conn, sorted(ts_set), commit=False)
 
                 with conn.cursor() as cur:
                     time_map = _fetch_mapping_any(cur, "dim_time", "ts_utc", "time_key", list(ts_set))
@@ -703,7 +717,7 @@ def pipeline_3_production():
                     conn.commit()
                     return len(rows)
 
-            # Lese Daten von Staging-Tabelle
+            # Read data from staging table
             with conn.cursor() as cur:
                 query = f"""
                 SELECT
@@ -717,63 +731,97 @@ def pipeline_3_production():
                 """
                 cur.execute(query, params_list)
 
-                for row in cur:
-                    stats["seen"] += 1
-                    doc = {
-                        "block_hash": row[0],
-                        "block_number": row[1],
-                        "timestamp_unix": row[2],
-                        "tx_count": row[3],
-                        "miner": row[4],
-                        "gas_used": row[5],
-                        "gas_limit": row[6],
-                        "size_bytes": row[7],
-                        "base_fee_per_gas": row[8],
-                        "blob_gas_used": row[9],
-                        "excess_blob_gas": row[10],
-                        "ingestion_ds": row[11],
-                        "ingested_at": row[12],
-                        "staged_at": row[13],
-                    }
-                    batch.append(doc)
-
-                    if len(batch) >= settings.batch_blocks:
-                        stats["inserted_or_updated"] += process_batch(batch)
-                        stats["batches"] += 1
-                        batch = []
-
-            if batch:
-                stats["inserted_or_updated"] += process_batch(batch)
-                stats["batches"] += 1
+                cur.arraysize = max(1, settings.batch_blocks)
+                while True:
+                    rows = cur.fetchmany(settings.batch_blocks)
+                    if not rows:
+                        break
+                    batch = []
+                    for row in rows:
+                        stats["seen"] += 1
+                        batch.append(
+                            {
+                                "block_hash": row[0],
+                                "block_number": row[1],
+                                "timestamp_unix": row[2],
+                                "tx_count": row[3],
+                                "miner": row[4],
+                                "gas_used": row[5],
+                                "gas_limit": row[6],
+                                "size_bytes": row[7],
+                                "base_fee_per_gas": row[8],
+                                "blob_gas_used": row[9],
+                                "excess_blob_gas": row[10],
+                                "ingestion_ds": row[11],
+                                "ingested_at": row[12],
+                                "staged_at": row[13],
+                            }
+                        )
+                    stats["inserted_or_updated"] += process_batch(batch)
+                    stats["batches"] += 1
 
             if stats["inserted_or_updated"] == 0:
                 raise AirflowSkipException("Keine neuen/validen Etherscan-Blöcke zum Laden gefunden.")
 
-            if last_staged_at and last_staged_at != checkpoint:
-                Variable.set(CHECKPOINT_ETHERSCAN_VAR, last_staged_at)
-                stats["checkpoint"] = last_staged_at
+            stats["new_checkpoint"] = last_staged_at
 
             return stats
         finally:
             conn.close()
 
+    @task
+    def update_binance_checkpoint(stats: Dict[str, Any]) -> Dict[str, Any]:
+        previous = stats.get("checkpoint")
+        new_val = stats.get("new_checkpoint")
+        if new_val and new_val != previous:
+            Variable.set(CHECKPOINT_BINANCE_VAR, str(new_val))
+            return {"checkpoint": str(new_val)}
+        return {"checkpoint": previous}
+
+    @task
+    def update_etherscan_checkpoint(stats: Dict[str, Any]) -> Dict[str, Any]:
+        previous = stats.get("checkpoint")
+        new_val = stats.get("new_checkpoint")
+        if new_val and new_val != previous:
+            Variable.set(CHECKPOINT_ETHERSCAN_VAR, str(new_val))
+            return {"checkpoint": str(new_val)}
+        return {"checkpoint": previous}
+
     @task(trigger_rule="all_done")
-    def log_summary(binance_stats: Dict[str, Any], etherscan_stats: Dict[str, Any]) -> None:
+    def log_summary(
+        binance_stats: Dict[str, Any],
+        etherscan_stats: Dict[str, Any],
+        binance_checkpoint: Dict[str, Any],
+        etherscan_checkpoint: Dict[str, Any],
+    ) -> None:
         print("=" * 60)
         print("Pipeline 3 (Production / Data Warehouse) Summary:")
         print("=" * 60)
         print(f"Binance: {binance_stats}")
         print(f"Ethereum: {etherscan_stats}")
+        print(f"Binance checkpoint: {binance_checkpoint}")
+        print(f"Ethereum checkpoint: {etherscan_checkpoint}")
         print("=" * 60)
         print("Star Schema in postgres-data:dw erfolgreich aktualisiert!")
         print("=" * 60)
 
     settings = get_settings()
     created = create_dw_schema(settings)
-    binance_stats = load_binance_candles(settings)
-    etherscan_stats = load_etherscan_blocks(settings)
-    created >> [binance_stats, etherscan_stats]
-    log_summary(binance_stats, etherscan_stats)
+    exchange_key = get_exchange_key(settings)
+    chain_key = get_chain_key(settings)
+    created >> [exchange_key, chain_key]
+
+    binance_stats = load_binance_candles(settings, exchange_key)
+    etherscan_stats = load_etherscan_blocks(settings, chain_key)
+    exchange_key >> binance_stats
+    chain_key >> etherscan_stats
+
+    binance_checkpoint = update_binance_checkpoint(binance_stats)
+    etherscan_checkpoint = update_etherscan_checkpoint(etherscan_stats)
+    binance_stats >> binance_checkpoint
+    etherscan_stats >> etherscan_checkpoint
+
+    log_summary(binance_stats, etherscan_stats, binance_checkpoint, etherscan_checkpoint)
 
 
 pipeline_3_production()
