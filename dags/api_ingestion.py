@@ -1,13 +1,13 @@
 """
 API Ingestion DAG
 =================
-Ruft Daten von externen APIs ab und speichert sie als Rohdaten (JSON/JSONL).
-Diese DAG ist OPTIONAL - kann übersprungen werden, wenn man mit Sample-Daten arbeitet.
+Fetches data from external APIs and stores it as raw data (JSON/JSONL).
+This DAG is OPTIONAL - it can be skipped when working with sample data.
 
 APIs:
-- Binance (Kline/Candle-Daten)
-- Etherscan (Ethereum Block-Daten)
-- CoinMarketCap (Kryptowährungsdaten)
+- Binance (kline/candle data)
+- Etherscan (Ethereum block data)
+- CoinMarketCap (cryptocurrency data)
 """
 from __future__ import annotations
 
@@ -27,17 +27,17 @@ except ModuleNotFoundError:
 from airflow.exceptions import AirflowSkipException
 from airflow.models import Variable
 
-# Daten-Speicherorte (werden von Pipeline 1 gelesen)
+# Storage locations (read by Pipeline 1)
 BINANCE_OUTPUT_DIR = Path("/opt/airflow/dags/data/binance_klines")
 ETHERSCAN_OUTPUT_DIR = Path("/opt/airflow/dags/data/ethereum_blocks")
 COINMARKETCAP_OUTPUT_DIR = Path("/opt/airflow/dags/data/coinmarketcap")
 
-# API-Endpoints
+# API endpoints
 BINANCE_API_URL = "https://api.binance.com/api/v3/klines"
 ETHERSCAN_API_URL = "https://api.etherscan.io/api"
 COINMARKETCAP_API_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
 
-# Standard-Symbole/Parameter
+# Default symbols/parameters
 DEFAULT_BINANCE_SYMBOLS = ["ETHUSDT", "BTCUSDT"]
 DEFAULT_BINANCE_INTERVAL = "1h"
 DEFAULT_BINANCE_LIMIT = 100
@@ -49,7 +49,7 @@ DEFAULT_COINMARKETCAP_LIMIT = 100
     start_date=pendulum.datetime(2025, 10, 1, tz="Europe/Paris"),
     schedule="@hourly",
     catchup=False,
-    is_paused_upon_creation=True,  # Standardmäßig pausiert - optional, nur mit API-Keys
+    is_paused_upon_creation=True,  # paused by default (optional; requires API keys)
     tags=["api", "ingestion", "optional"],
     default_args=dict(retries=2, retry_delay=pendulum.duration(minutes=5)),
     description="API Ingestion: Ruft Daten von Binance, Etherscan und CoinMarketCap ab (optional, kann mit Sample-Daten übersprungen werden).",
@@ -58,8 +58,8 @@ def api_ingestion():
     @task
     def fetch_binance_klines(ds: str) -> Dict[str, Any]:
         """
-        Ruft Binance Kline-Daten ab und speichert sie als JSONL.
-        Überspringt bei fehlendem/ungültigem API-Key.
+        Fetches Binance kline data and stores it as JSONL.
+        Skips if the API is unavailable (or request fails).
         """
         symbols_raw = Variable.get("BINANCE_SYMBOLS", default_var=",".join(DEFAULT_BINANCE_SYMBOLS))
         symbols = [s.strip() for s in symbols_raw.split(",") if s.strip()]
@@ -82,13 +82,13 @@ def api_ingestion():
                 response.raise_for_status()
                 klines = response.json()
 
-                # Speichere als JSONL
+                # Store as JSONL
                 output_file = output_dir / f"{symbol}-{interval}.jsonl"
                 ingestion_time = pendulum.now("UTC").to_iso8601_string()
 
                 with output_file.open("w", encoding="utf-8") as f:
                     for kline in klines:
-                        # Binance Kline Format: [open_time, open, high, low, close, volume, close_time, ...]
+                        # Binance kline format: [open_time, open, high, low, close, volume, close_time, ...]
                         if len(kline) < 7:
                             continue
 
@@ -128,8 +128,8 @@ def api_ingestion():
     @task
     def fetch_etherscan_blocks(ds: str) -> Dict[str, Any]:
         """
-        Ruft Ethereum Block-Daten von Etherscan ab.
-        Überspringt bei fehlendem/ungültigem API-Key.
+        Fetches Ethereum block data from Etherscan.
+        Skips if the API key is missing/invalid.
         """
         api_key = Variable.get("ETHERSCAN_API_KEY", default_var="")
         if not api_key or api_key == "***":
@@ -139,7 +139,7 @@ def api_ingestion():
         output_dir.mkdir(parents=True, exist_ok=True)
         output_file = output_dir / "blocks.jsonl"
 
-        # Hole neueste Blocknummer
+        # Fetch latest block number
         try:
             response = requests.get(
                 ETHERSCAN_API_URL,
@@ -157,7 +157,7 @@ def api_ingestion():
                 raise AirflowSkipException("Keine Blocknummer von Etherscan erhalten")
 
             latest_block = int(latest_block_hex, 16)
-            start_block = max(0, latest_block - 10)  # Hole letzte 10 Blöcke
+            start_block = max(0, latest_block - 10)  # fetch last 10 blocks
 
             blocks_fetched = 0
             ingestion_time = pendulum.now("UTC").to_iso8601_string()
@@ -197,8 +197,8 @@ def api_ingestion():
     @task
     def fetch_coinmarketcap_data(ds: str) -> Dict[str, Any]:
         """
-        Ruft CoinMarketCap-Daten ab.
-        Überspringt bei fehlendem/ungültigem API-Key.
+        Fetches CoinMarketCap data.
+        Skips if the API key is missing/invalid.
         """
         api_key = Variable.get("COINMARKETCAP_API_KEY", default_var="")
         if not api_key:
@@ -225,7 +225,7 @@ def api_ingestion():
             response.raise_for_status()
             data = response.json()
 
-            # Speichere komplette Response
+            # Store full response
             output_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
             crypto_count = len(data.get("data", []))
@@ -242,7 +242,7 @@ def api_ingestion():
 
     @task(trigger_rule="all_done")
     def log_summary(binance: Dict[str, Any], etherscan: Dict[str, Any], cmc: Dict[str, Any]) -> None:
-        """Loggt Zusammenfassung der API-Aufrufe"""
+        """Logs a summary of the API calls."""
         print("=" * 60)
         print("API Ingestion Summary:")
         print("=" * 60)
