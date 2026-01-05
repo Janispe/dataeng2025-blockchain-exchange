@@ -72,11 +72,11 @@ def _pg_connect(settings: Settings):
     start_date=pendulum.datetime(2025, 10, 1, tz="Europe/Paris"),
     schedule="@daily",
     catchup=False,
-    tags=["dw", "analysis", "correlation"],
+    tags=["pipeline-4", "analytics", "analysis", "correlation"],
     default_args=dict(retries=2, retry_delay=pendulum.duration(minutes=2)),
-    description="Analysis: correlation between off-chain ETH price (Binance) and on-chain base fee (Ethereum, gwei).",
+    description="Pipeline 4: Analytics - Analysiert Korrelation zwischen ETH-Preis (Binance) und Gas-Gebühren (Ethereum).",
 )
-def analysis_eth_price_vs_gas_fee():
+def pipeline_4_analytics():
     @task
     def get_settings() -> Dict[str, Any]:
         pg_host = Variable.get("DW_PG_HOST", default_var=DEFAULT_PG_HOST)
@@ -407,4 +407,4 @@ def analysis_eth_price_vs_gas_fee():
     log_summary(result, plot_result)
 
 
-analysis_eth_price_vs_gas_fee()
+pipeline_4_analytics()

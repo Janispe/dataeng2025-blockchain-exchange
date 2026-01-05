@@ -5,7 +5,6 @@ from datetime import date, datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pendulum
-from pymongo import MongoClient
 
 try:
     from airflow.sdk.dag import dag
@@ -15,11 +14,6 @@ except ModuleNotFoundError:
 from airflow.exceptions import AirflowSkipException
 from airflow.models import Variable
 
-DEFAULT_MONGO_URI = "mongodb://root:example@mongodb:27017"
-DEFAULT_MONGO_DB = "blockchain"
-DEFAULT_BINANCE_COLLECTION = "binance_candles"
-DEFAULT_ETHERSCAN_COLLECTION = "etherscan_blocks"
-
 # Dedicated project Postgres (compose.yml: service "postgres-data")
 DEFAULT_PG_HOST = "postgres-data"
 DEFAULT_PG_PORT = 5432
@@ -28,6 +22,7 @@ DEFAULT_PG_USER = "datauser"
 DEFAULT_PG_PASSWORD = "datapass"
 
 DW_SCHEMA = "dw"
+STAGING_SCHEMA = "staging"
 
 BINANCE_EXCHANGE_NAME = "Binance"
 ETHEREUM_CHAIN_NAME = "Ethereum"
@@ -36,8 +31,8 @@ ETHEREUM_CHAIN_ID = 1
 DEFAULT_BATCH_SIZE_CANDLES = 2000
 DEFAULT_BATCH_SIZE_BLOCKS = 500
 
-CHECKPOINT_BINANCE_VAR = "DW_LAST_BINANCE_CANDLES_INGESTED_AT"
-CHECKPOINT_ETHERSCAN_VAR = "DW_LAST_ETHERSCAN_BLOCKS_INGESTED_AT"
+CHECKPOINT_BINANCE_VAR = "DW_LAST_BINANCE_STAGING_AT"
+CHECKPOINT_ETHERSCAN_VAR = "DW_LAST_ETHERSCAN_STAGING_AT"
 
 
 def _pg_connect(settings: "Settings"):
@@ -336,10 +331,6 @@ def _ensure_dim_intervals(conn, intervals: Sequence[str]) -> None:
 
 @dataclass(frozen=True)
 class Settings:
-    mongo_uri: str
-    mongo_db: str
-    binance_collection: str
-    etherscan_collection: str
     pg_host: str
     pg_port: int
     pg_db: str
@@ -353,22 +344,13 @@ class Settings:
     start_date=pendulum.datetime(2025, 10, 1, tz="Europe/Paris"),
     schedule="@hourly",
     catchup=False,
-    tags=["mongodb", "postgres", "star-schema", "dw"],
+    tags=["pipeline-3", "production", "star-schema", "dw"],
     default_args=dict(retries=2, retry_delay=pendulum.duration(minutes=2)),
-    description="Lädt MongoDB (binance_candles + etherscan_blocks) in ein Star-Schema in Postgres (schema dw).",
+    description="Pipeline 3: Lädt Staging-Daten (Binance, Ethereum, CoinMarketCap) in Star-Schema (Production Zone / Data Warehouse).",
 )
-def mongo_to_dw_star_schema():
+def pipeline_3_production():
     @task
     def get_settings() -> Dict[str, Any]:
-        mongo_uri = Variable.get("MONGO_URI", default_var=DEFAULT_MONGO_URI)
-        mongo_db = Variable.get("MONGO_DB", default_var=DEFAULT_MONGO_DB)
-        binance_collection = Variable.get(
-            "BINANCE_MONGO_COLLECTION", default_var=DEFAULT_BINANCE_COLLECTION
-        )
-        etherscan_collection = Variable.get(
-            "ETHERSCAN_MONGO_COLLECTION", default_var=DEFAULT_ETHERSCAN_COLLECTION
-        )
-
         pg_host = Variable.get("DW_PG_HOST", default_var=DEFAULT_PG_HOST)
         pg_port_raw = Variable.get("DW_PG_PORT", default_var=str(DEFAULT_PG_PORT))
         pg_db = Variable.get("DW_PG_DB", default_var=DEFAULT_PG_DB)
@@ -396,10 +378,6 @@ def mongo_to_dw_star_schema():
             batch_blocks = DEFAULT_BATCH_SIZE_BLOCKS
 
         s = Settings(
-            mongo_uri=mongo_uri,
-            mongo_db=mongo_db,
-            binance_collection=binance_collection,
-            etherscan_collection=etherscan_collection,
             pg_host=pg_host,
             pg_port=pg_port,
             pg_db=pg_db,
@@ -423,37 +401,17 @@ def mongo_to_dw_star_schema():
     def load_binance_candles(settings_dict: Dict[str, Any]) -> Dict[str, Any]:
         settings = Settings(**settings_dict)
         checkpoint = Variable.get(CHECKPOINT_BINANCE_VAR, default_var=None)
-        query: Dict[str, Any] = {}
+
+        # Query für Staging-Tabelle
+        where_clause = ""
+        params_list: List[Any] = []
         if checkpoint:
-            query = {"ingested_at": {"$gt": checkpoint}}
-
-        client = MongoClient(settings.mongo_uri)
-        coll = client[settings.mongo_db][settings.binance_collection]
-
-        projection = {
-            "_id": 0,
-            "symbol": 1,
-            "interval": 1,
-            "trading_day": 1,
-            "open_time_ms": 1,
-            "close_time_ms": 1,
-            "open": 1,
-            "high": 1,
-            "low": 1,
-            "close": 1,
-            "volume": 1,
-            "quote_asset_volume": 1,
-            "number_of_trades": 1,
-            "taker_buy_base_volume": 1,
-            "taker_buy_quote_volume": 1,
-            "source_file": 1,
-            "ingested_at": 1,
-        }
-
-        cursor = coll.find(query, projection=projection).sort("ingested_at", 1)
+            where_clause = f"WHERE staged_at > %s"
+            params_list.append(checkpoint)
 
         conn = _pg_connect(settings)
         try:
+            # Hole exchange_key
             with conn.cursor() as cur:
                 exchange_key = _fetch_one_int(
                     cur,
@@ -463,10 +421,10 @@ def mongo_to_dw_star_schema():
 
             stats = {"seen": 0, "inserted_or_updated": 0, "batches": 0, "checkpoint": checkpoint}
             batch: List[Dict[str, Any]] = []
-            last_ingested_at: Optional[str] = checkpoint
+            last_staged_at: Optional[str] = checkpoint
 
             def process_batch(docs: List[Dict[str, Any]]) -> int:
-                nonlocal last_ingested_at
+                nonlocal last_staged_at
                 symbols = sorted({(d.get("symbol") or "").strip().upper() for d in docs if d.get("symbol")})
                 intervals = sorted({(d.get("interval") or "").strip() for d in docs if d.get("interval")})
 
@@ -478,9 +436,9 @@ def mongo_to_dw_star_schema():
                         ts_set.add(ot)
                     if ct:
                         ts_set.add(ct)
-                    ia = d.get("ingested_at")
-                    if isinstance(ia, str):
-                        last_ingested_at = ia
+                    sa = d.get("staged_at")
+                    if sa:
+                        last_staged_at = str(sa)
 
                 _ensure_dim_assets(conn, symbols)
                 _ensure_dim_intervals(conn, intervals)
@@ -508,18 +466,17 @@ def mongo_to_dw_star_schema():
                         if not asset_key or not interval_key or not open_time_key or not close_time_key:
                             continue
 
-                        trading_day_raw = d.get("trading_day")
-                        trading_day: Optional[date] = None
-                        if isinstance(trading_day_raw, str):
+                        trading_day = d.get("trading_day")
+                        if isinstance(trading_day, str):
                             try:
-                                trading_day = date.fromisoformat(trading_day_raw)
+                                trading_day = date.fromisoformat(trading_day)
                             except ValueError:
                                 trading_day = None
 
-                        ingested_at_dt = None
-                        if isinstance(d.get("ingested_at"), str):
+                        ingested_at_dt = d.get("ingested_at")
+                        if isinstance(ingested_at_dt, str):
                             try:
-                                ingested_at_dt = pendulum.parse(d["ingested_at"]).in_timezone("UTC")
+                                ingested_at_dt = pendulum.parse(ingested_at_dt).in_timezone("UTC")
                             except Exception:
                                 ingested_at_dt = None
 
@@ -576,13 +533,47 @@ def mongo_to_dw_star_schema():
                     conn.commit()
                     return len(rows)
 
-            for doc in cursor:
-                stats["seen"] += 1
-                batch.append(doc)
-                if len(batch) >= settings.batch_candles:
-                    stats["inserted_or_updated"] += process_batch(batch)
-                    stats["batches"] += 1
-                    batch = []
+            # Lese Daten von Staging-Tabelle
+            with conn.cursor() as cur:
+                query = f"""
+                SELECT
+                    symbol, interval, open_time_ms, close_time_ms, trading_day,
+                    open, high, low, close, volume, quote_asset_volume,
+                    number_of_trades, taker_buy_base_volume, taker_buy_quote_volume,
+                    source_file, ingested_at, staged_at
+                FROM {STAGING_SCHEMA}.binance_candles
+                {where_clause}
+                ORDER BY staged_at
+                """
+                cur.execute(query, params_list)
+
+                for row in cur:
+                    stats["seen"] += 1
+                    doc = {
+                        "symbol": row[0],
+                        "interval": row[1],
+                        "open_time_ms": row[2],
+                        "close_time_ms": row[3],
+                        "trading_day": row[4],
+                        "open": row[5],
+                        "high": row[6],
+                        "low": row[7],
+                        "close": row[8],
+                        "volume": row[9],
+                        "quote_asset_volume": row[10],
+                        "number_of_trades": row[11],
+                        "taker_buy_base_volume": row[12],
+                        "taker_buy_quote_volume": row[13],
+                        "source_file": row[14],
+                        "ingested_at": row[15],
+                        "staged_at": row[16],
+                    }
+                    batch.append(doc)
+
+                    if len(batch) >= settings.batch_candles:
+                        stats["inserted_or_updated"] += process_batch(batch)
+                        stats["batches"] += 1
+                        batch = []
 
             if batch:
                 stats["inserted_or_updated"] += process_batch(batch)
@@ -591,37 +582,25 @@ def mongo_to_dw_star_schema():
             if stats["inserted_or_updated"] == 0:
                 raise AirflowSkipException("Keine neuen/validen Binance-Candles zum Laden gefunden.")
 
-            if last_ingested_at and last_ingested_at != checkpoint:
-                Variable.set(CHECKPOINT_BINANCE_VAR, last_ingested_at)
-                stats["checkpoint"] = last_ingested_at
+            if last_staged_at and last_staged_at != checkpoint:
+                Variable.set(CHECKPOINT_BINANCE_VAR, last_staged_at)
+                stats["checkpoint"] = last_staged_at
 
             return stats
         finally:
             conn.close()
-            client.close()
 
     @task
     def load_etherscan_blocks(settings_dict: Dict[str, Any]) -> Dict[str, Any]:
         settings = Settings(**settings_dict)
         checkpoint = Variable.get(CHECKPOINT_ETHERSCAN_VAR, default_var=None)
-        query: Dict[str, Any] = {}
+
+        # Query für Staging-Tabelle
+        where_clause = ""
+        params_list: List[Any] = []
         if checkpoint:
-            query = {"ingested_at": {"$gt": checkpoint}}
-
-        client = MongoClient(settings.mongo_uri)
-        coll = client[settings.mongo_db][settings.etherscan_collection]
-
-        projection = {
-            "_id": 0,
-            "hash": 1,
-            "number": 1,
-            "timestamp_unix": 1,
-            "tx_count": 1,
-            "raw": 1,
-            "ingestion_ds": 1,
-            "ingested_at": 1,
-        }
-        cursor = coll.find(query, projection=projection).sort("ingested_at", 1)
+            where_clause = f"WHERE staged_at > %s"
+            params_list.append(checkpoint)
 
         conn = _pg_connect(settings)
         try:
@@ -634,18 +613,18 @@ def mongo_to_dw_star_schema():
 
             stats = {"seen": 0, "inserted_or_updated": 0, "batches": 0, "checkpoint": checkpoint}
             batch: List[Dict[str, Any]] = []
-            last_ingested_at: Optional[str] = checkpoint
+            last_staged_at: Optional[str] = checkpoint
 
             def process_batch(docs: List[Dict[str, Any]]) -> int:
-                nonlocal last_ingested_at
+                nonlocal last_staged_at
                 ts_set = set()
                 for d in docs:
                     bt = _to_utc_dt_from_unix_seconds(d.get("timestamp_unix"))
                     if bt:
                         ts_set.add(bt)
-                    ia = d.get("ingested_at")
-                    if isinstance(ia, str):
-                        last_ingested_at = ia
+                    sa = d.get("staged_at")
+                    if sa:
+                        last_staged_at = str(sa)
 
                 _ensure_dim_time(conn, sorted(ts_set))
 
@@ -661,27 +640,36 @@ def mongo_to_dw_star_schema():
                         if not block_time_key:
                             continue
 
-                        raw = d.get("raw") if isinstance(d.get("raw"), dict) else {}
+                        ingested_at_dt = d.get("ingested_at")
+                        if isinstance(ingested_at_dt, str):
+                            try:
+                                ingested_at_dt = pendulum.parse(ingested_at_dt).in_timezone("UTC")
+                            except Exception:
+                                ingested_at_dt = None
+
+                        ingestion_ds = d.get("ingestion_ds")
+                        if isinstance(ingestion_ds, str):
+                            try:
+                                ingestion_ds = date.fromisoformat(ingestion_ds)
+                            except ValueError:
+                                ingestion_ds = None
+
                         rows.append(
                             (
                                 chain_key,
                                 block_time_key,
-                                d.get("number"),
-                                d.get("hash"),
+                                d.get("block_number"),
+                                d.get("block_hash"),
                                 d.get("tx_count"),
-                                raw.get("miner"),
-                                _parse_hex_int(raw.get("gasUsed")),
-                                _parse_hex_int(raw.get("gasLimit")),
-                                _parse_hex_int(raw.get("size")),
-                                _parse_hex_int(raw.get("baseFeePerGas")),
-                                _parse_hex_int(raw.get("blobGasUsed")),
-                                _parse_hex_int(raw.get("excessBlobGas")),
-                                pendulum.parse(d["ingested_at"]).in_timezone("UTC")
-                                if isinstance(d.get("ingested_at"), str)
-                                else None,
-                                date.fromisoformat(d["ingestion_ds"])
-                                if isinstance(d.get("ingestion_ds"), str)
-                                else None,
+                                d.get("miner"),
+                                d.get("gas_used"),
+                                d.get("gas_limit"),
+                                d.get("size_bytes"),
+                                d.get("base_fee_per_gas"),
+                                d.get("blob_gas_used"),
+                                d.get("excess_blob_gas"),
+                                ingested_at_dt,
+                                ingestion_ds,
                             )
                         )
 
@@ -715,13 +703,44 @@ def mongo_to_dw_star_schema():
                     conn.commit()
                     return len(rows)
 
-            for doc in cursor:
-                stats["seen"] += 1
-                batch.append(doc)
-                if len(batch) >= settings.batch_blocks:
-                    stats["inserted_or_updated"] += process_batch(batch)
-                    stats["batches"] += 1
-                    batch = []
+            # Lese Daten von Staging-Tabelle
+            with conn.cursor() as cur:
+                query = f"""
+                SELECT
+                    block_hash, block_number, timestamp_unix, tx_count,
+                    miner, gas_used, gas_limit, size_bytes,
+                    base_fee_per_gas, blob_gas_used, excess_blob_gas,
+                    ingestion_ds, ingested_at, staged_at
+                FROM {STAGING_SCHEMA}.ethereum_blocks
+                {where_clause}
+                ORDER BY staged_at
+                """
+                cur.execute(query, params_list)
+
+                for row in cur:
+                    stats["seen"] += 1
+                    doc = {
+                        "block_hash": row[0],
+                        "block_number": row[1],
+                        "timestamp_unix": row[2],
+                        "tx_count": row[3],
+                        "miner": row[4],
+                        "gas_used": row[5],
+                        "gas_limit": row[6],
+                        "size_bytes": row[7],
+                        "base_fee_per_gas": row[8],
+                        "blob_gas_used": row[9],
+                        "excess_blob_gas": row[10],
+                        "ingestion_ds": row[11],
+                        "ingested_at": row[12],
+                        "staged_at": row[13],
+                    }
+                    batch.append(doc)
+
+                    if len(batch) >= settings.batch_blocks:
+                        stats["inserted_or_updated"] += process_batch(batch)
+                        stats["batches"] += 1
+                        batch = []
 
             if batch:
                 stats["inserted_or_updated"] += process_batch(batch)
@@ -730,18 +749,24 @@ def mongo_to_dw_star_schema():
             if stats["inserted_or_updated"] == 0:
                 raise AirflowSkipException("Keine neuen/validen Etherscan-Blöcke zum Laden gefunden.")
 
-            if last_ingested_at and last_ingested_at != checkpoint:
-                Variable.set(CHECKPOINT_ETHERSCAN_VAR, last_ingested_at)
-                stats["checkpoint"] = last_ingested_at
+            if last_staged_at and last_staged_at != checkpoint:
+                Variable.set(CHECKPOINT_ETHERSCAN_VAR, last_staged_at)
+                stats["checkpoint"] = last_staged_at
 
             return stats
         finally:
             conn.close()
-            client.close()
 
     @task(trigger_rule="all_done")
     def log_summary(binance_stats: Dict[str, Any], etherscan_stats: Dict[str, Any]) -> None:
-        print(f"mongo_to_dw_star_schema: binance={binance_stats}, etherscan={etherscan_stats}")
+        print("=" * 60)
+        print("Pipeline 3 (Production / Data Warehouse) Summary:")
+        print("=" * 60)
+        print(f"Binance: {binance_stats}")
+        print(f"Ethereum: {etherscan_stats}")
+        print("=" * 60)
+        print("Star Schema in postgres-data:dw erfolgreich aktualisiert!")
+        print("=" * 60)
 
     settings = get_settings()
     created = create_dw_schema(settings)
@@ -751,4 +776,4 @@ def mongo_to_dw_star_schema():
     log_summary(binance_stats, etherscan_stats)
 
 
-mongo_to_dw_star_schema()
+pipeline_3_production()
