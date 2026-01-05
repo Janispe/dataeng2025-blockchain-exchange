@@ -195,11 +195,22 @@ def pipeline_1_landing():
                                 "open_time_ms": doc["open_time_ms"],
                             }
 
+                            # Avoid conflicting updates: the JSONL docs already contain `ingested_at`
+                            # (API ingestion timestamp). In MongoDB you cannot update the same field
+                            # in both `$set` and `$setOnInsert`.
+                            source_ingested_at = doc.get("ingested_at")
+                            doc_for_set = dict(doc)
+                            doc_for_set.pop("ingested_at", None)
+
+                            set_doc = {**doc_for_set, "updated_at": updated_at}
+                            if source_ingested_at is not None:
+                                set_doc["source_ingested_at"] = source_ingested_at
+
                             batch.append(
                                 UpdateOne(
                                     key,
                                     {
-                                        "$set": {**doc, "updated_at": updated_at},
+                                        "$set": set_doc,
                                         "$setOnInsert": {
                                             "ingested_at": ingested_at,
                                             "ingestion_ds": ds,
