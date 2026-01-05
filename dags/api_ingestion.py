@@ -5,9 +5,18 @@ Fetches data from external APIs and stores it as raw data (JSON/JSONL).
 This DAG is OPTIONAL - can be skipped when working with sample data.
 
 APIs:
-- Binance (Kline/Candle data)
-- Etherscan (Ethereum block data)
-- CoinMarketCap (Cryptocurrency data)
+- Binance (Kline/Candle data) - runs every minute
+- Etherscan (Ethereum block data) - runs every minute
+- CoinMarketCap (Cryptocurrency data) - runs every 15 minutes (Smart Skip)
+
+Scheduling Strategy:
+--------------------
+- DAG schedule: Every minute (*/1 * * * *)
+- Binance & Etherscan: Execute on every DAG run (every minute)
+- CoinMarketCap: Uses "Smart Skip" to only run every 15 minutes
+  - Checks COINMARKETCAP_LAST_RUN Airflow Variable
+  - Skips if less than 15 minutes since last successful run
+  - Respects API rate limits: ~96 calls/day (within 333/day free tier)
 """
 from __future__ import annotations
 
@@ -47,7 +56,7 @@ DEFAULT_COINMARKETCAP_LIMIT = 100
 
 @dag(
     start_date=pendulum.datetime(2025, 10, 1, tz="Europe/Paris"),
-    schedule="@hourly",
+    schedule="*/1 * * * *",  # Every minute (Binance + Etherscan), CoinMarketCap uses Smart Skip (every 15min)
     catchup=False,
     is_paused_upon_creation=True,  # Paused by default - optional, only with API keys
     tags=["api", "ingestion", "optional"],
@@ -199,7 +208,24 @@ def api_ingestion():
         """
         Fetches CoinMarketCap data.
         Skips if API key is missing/invalid.
+        Uses Smart Skip: Only runs every 15 minutes (even though DAG runs every minute).
         """
+        # Smart Skip: Check if 15 minutes have passed since last run
+        last_run_str = Variable.get("COINMARKETCAP_LAST_RUN", default_var="")
+        if last_run_str:
+            try:
+                last_run = pendulum.parse(last_run_str)
+                now = pendulum.now("UTC")
+                minutes_since_last_run = (now - last_run).total_minutes()
+
+                if minutes_since_last_run < 15:
+                    raise AirflowSkipException(
+                        f"CoinMarketCap: Skipping - only {minutes_since_last_run:.1f} minutes since last run "
+                        f"(requires 15 minutes). Last run: {last_run_str}"
+                    )
+            except Exception as e:
+                print(f"Warning: Could not parse COINMARKETCAP_LAST_RUN timestamp: {e}")
+
         api_key = Variable.get("COINMARKETCAP_API_KEY", default_var="")
         if not api_key:
             raise AirflowSkipException("COINMARKETCAP_API_KEY not configured - skipping API call")
@@ -230,6 +256,11 @@ def api_ingestion():
 
             crypto_count = len(data.get("data", []))
             print(f"✓ CoinMarketCap: {crypto_count} cryptocurrencies → {output_file}")
+
+            # Update last run timestamp for Smart Skip
+            now = pendulum.now("UTC").to_iso8601_string()
+            Variable.set("COINMARKETCAP_LAST_RUN", now)
+            print(f"✓ Updated COINMARKETCAP_LAST_RUN to {now}")
 
             return {
                 "crypto_count": crypto_count,
