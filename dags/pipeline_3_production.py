@@ -387,6 +387,7 @@ class Settings:
     start_date=pendulum.datetime(2025, 10, 1, tz="Europe/Paris"),
     schedule="@hourly",
     catchup=False,
+    max_active_runs=1,
     tags=["pipeline-3", "production", "star-schema", "dw"],
     default_args=dict(retries=2, retry_delay=pendulum.duration(minutes=2)),
     description="Pipeline 3: Loads Staging data (Binance, Ethereum, CoinMarketCap) into Star Schema (Production Zone / Data Warehouse).",

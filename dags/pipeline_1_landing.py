@@ -82,6 +82,7 @@ def _pg_connect_landing():
     start_date=pendulum.datetime(2025, 10, 1, tz="Europe/Paris"),
     schedule="*/15 * * * *",  # Every 15 minutes
     catchup=False,
+    max_active_runs=1,
     tags=["pipeline-1", "landing", "ingestion"],
     default_args=dict(retries=2, retry_delay=pendulum.duration(minutes=2)),
     description="Pipeline 1: Loads raw data (API results or sample files) into Landing Zone (MongoDB/Postgres).",

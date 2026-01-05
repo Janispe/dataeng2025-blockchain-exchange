@@ -58,6 +58,7 @@ DEFAULT_COINMARKETCAP_LIMIT = 100
     start_date=pendulum.datetime(2025, 10, 1, tz="Europe/Paris"),
     schedule="*/1 * * * *",  # Every minute (Binance + Etherscan), CoinMarketCap uses Smart Skip (every 15min)
     catchup=False,
+    max_active_runs=1,
     is_paused_upon_creation=True,  # Paused by default - optional, only with API keys
     tags=["api", "ingestion", "optional"],
     default_args=dict(retries=2, retry_delay=pendulum.duration(minutes=5)),
