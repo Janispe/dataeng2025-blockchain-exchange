@@ -63,6 +63,9 @@ x-airflow-common:
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_API_AUTH_JWT_SECRET}
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    # Airflow Variables via env (optional; set in .env)
+    AIRFLOW_VAR_COINMARKETCAP_API_KEY: ${AIRFLOW_VAR_COINMARKETCAP_API_KEY:-}
+    AIRFLOW_VAR_ETHERSCAN_API_KEY: ${AIRFLOW_VAR_ETHERSCAN_API_KEY:-}
     # yamllint disable rule:line-length
     # Use simple http server on scheduler for health checks
     # See https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/logging-monitoring/check-health.html#scheduler-health-check-server
