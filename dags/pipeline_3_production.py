@@ -13,6 +13,10 @@ except ModuleNotFoundError:
     from airflow.decorators import dag, task
 from airflow.exceptions import AirflowSkipException
 from airflow.models import Variable
+from airflow.operators.empty import EmptyOperator
+from airflow.utils.trigger_rule import TriggerRule
+
+from pipeline_datasets import DW_DATASET, STAGING_DATASET
 
 # Dedicated project Postgres (compose.yml: service "postgres-data")
 DEFAULT_PG_HOST = "postgres-data"
@@ -30,9 +34,11 @@ ETHEREUM_CHAIN_ID = 1
 
 DEFAULT_BATCH_SIZE_CANDLES = 2000
 DEFAULT_BATCH_SIZE_BLOCKS = 500
+DEFAULT_BATCH_SIZE_CMC = 2000
 
 CHECKPOINT_BINANCE_VAR = "DW_LAST_BINANCE_STAGING_AT"
 CHECKPOINT_ETHERSCAN_VAR = "DW_LAST_ETHERSCAN_STAGING_AT"
+CHECKPOINT_CMC_VAR = "DW_LAST_CMC_METRICS_ID"
 
 
 def _pg_connect(settings: "Settings"):
@@ -236,6 +242,40 @@ def _ensure_dw_schema(conn) -> None:
 
     CREATE INDEX IF NOT EXISTS ix_fact_ethereum_block_time_key
       ON {DW_SCHEMA}.fact_ethereum_block (block_time_key);
+
+    CREATE TABLE IF NOT EXISTS {DW_SCHEMA}.dim_crypto (
+      crypto_id INTEGER PRIMARY KEY,
+      symbol TEXT NOT NULL,
+      name TEXT NOT NULL,
+      slug TEXT,
+      last_updated TIMESTAMP,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS ix_dim_crypto_symbol
+      ON {DW_SCHEMA}.dim_crypto (symbol);
+
+    CREATE TABLE IF NOT EXISTS {DW_SCHEMA}.fact_crypto_market_snapshot (
+      crypto_id INTEGER NOT NULL REFERENCES {DW_SCHEMA}.dim_crypto(crypto_id),
+      time_key BIGINT NOT NULL REFERENCES {DW_SCHEMA}.dim_time(time_key),
+      staged_metric_id BIGINT,
+
+      price_usd NUMERIC,
+      volume_24h NUMERIC,
+      market_cap NUMERIC,
+      percent_change_1h NUMERIC,
+      percent_change_24h NUMERIC,
+      percent_change_7d NUMERIC,
+      circulating_supply NUMERIC,
+      total_supply NUMERIC,
+      max_supply NUMERIC,
+
+      PRIMARY KEY (crypto_id, time_key)
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_fact_crypto_market_snapshot_metric_id
+      ON {DW_SCHEMA}.fact_crypto_market_snapshot (staged_metric_id)
+      WHERE staged_metric_id IS NOT NULL;
     """
     with conn.cursor() as cur:
         cur.execute(ddl)
@@ -341,11 +381,12 @@ class Settings:
     pg_password: str
     batch_candles: int
     batch_blocks: int
+    batch_cmc: int
 
 
 @dag(
     start_date=pendulum.datetime(2025, 10, 1, tz="Europe/Paris"),
-    schedule="@hourly",
+    schedule=[STAGING_DATASET],
     catchup=False,
     tags=["pipeline-3", "production", "star-schema", "dw"],
     default_args=dict(retries=2, retry_delay=pendulum.duration(minutes=2)),
@@ -366,6 +407,9 @@ def pipeline_3_production():
         batch_blocks_raw = Variable.get(
             "DW_BATCH_SIZE_BLOCKS", default_var=str(DEFAULT_BATCH_SIZE_BLOCKS)
         )
+        batch_cmc_raw = Variable.get(
+            "DW_BATCH_SIZE_CMC", default_var=str(DEFAULT_BATCH_SIZE_CMC)
+        )
 
         try:
             pg_port = int(pg_port_raw)
@@ -379,6 +423,10 @@ def pipeline_3_production():
             batch_blocks = max(1, int(batch_blocks_raw))
         except ValueError:
             batch_blocks = DEFAULT_BATCH_SIZE_BLOCKS
+        try:
+            batch_cmc = max(1, int(batch_cmc_raw))
+        except ValueError:
+            batch_cmc = DEFAULT_BATCH_SIZE_CMC
 
         s = Settings(
             pg_host=pg_host,
@@ -388,6 +436,7 @@ def pipeline_3_production():
             pg_password=pg_password,
             batch_candles=batch_candles,
             batch_blocks=batch_blocks,
+            batch_cmc=batch_cmc,
         )
         return s.__dict__
 
@@ -787,20 +836,234 @@ def pipeline_3_production():
             return {"checkpoint": str(new_val)}
         return {"checkpoint": previous}
 
+    @task
+    def load_coinmarketcap_metrics(settings_dict: Dict[str, Any]) -> Dict[str, Any]:
+        settings = Settings(**settings_dict)
+        checkpoint_raw = Variable.get(CHECKPOINT_CMC_VAR, default_var="0")
+        try:
+            checkpoint_id = int(checkpoint_raw)
+        except ValueError:
+            checkpoint_id = 0
+
+        conn = _pg_connect(settings)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT to_regclass(%s)", (f"{STAGING_SCHEMA}.crypto_metrics",))
+                metrics_reg = cur.fetchone()[0]
+                cur.execute("SELECT to_regclass(%s)", (f"{STAGING_SCHEMA}.cryptocurrencies",))
+                cryptos_reg = cur.fetchone()[0]
+                if not metrics_reg or not cryptos_reg:
+                    raise AirflowSkipException(
+                        f"Missing staging tables for CoinMarketCap ({STAGING_SCHEMA}.crypto_metrics / {STAGING_SCHEMA}.cryptocurrencies)."
+                    )
+
+                cur.execute(
+                    f"""
+                    SELECT
+                      m.id,
+                      m.crypto_id,
+                      c.symbol,
+                      c.name,
+                      c.slug,
+                      c.last_updated,
+                      m.recorded_at,
+                      m.price_usd,
+                      m.volume_24h,
+                      m.market_cap,
+                      m.percent_change_1h,
+                      m.percent_change_24h,
+                      m.percent_change_7d,
+                      m.circulating_supply,
+                      m.total_supply,
+                      m.max_supply
+                    FROM {STAGING_SCHEMA}.crypto_metrics m
+                    JOIN {STAGING_SCHEMA}.cryptocurrencies c ON c.crypto_id = m.crypto_id
+                    WHERE m.id > %s
+                    ORDER BY m.id
+                    """,
+                    (checkpoint_id,),
+                )
+
+                cur.arraysize = max(1, settings.batch_cmc)
+                stats = {"seen": 0, "inserted_or_updated": 0, "batches": 0, "checkpoint_id": checkpoint_id}
+                last_id = checkpoint_id
+
+                while True:
+                    rows = cur.fetchmany(settings.batch_cmc)
+                    if not rows:
+                        break
+
+                    stats["batches"] += 1
+                    stats["seen"] += len(rows)
+                    last_id = int(rows[-1][0])
+
+                    dim_crypto_rows: List[Tuple[Any, ...]] = []
+                    timestamps: List[datetime] = []
+                    fact_rows: List[Tuple[Any, ...]] = []
+
+                    for r in rows:
+                        metric_id = int(r[0])
+                        crypto_id = int(r[1])
+                        symbol = (r[2] or "").strip().upper()
+                        name = (r[3] or "").strip()
+                        slug = r[4] or None
+                        last_updated = r[5]
+                        recorded_at = r[6]
+
+                        if not symbol or not name or not isinstance(recorded_at, datetime):
+                            continue
+
+                        if recorded_at.tzinfo is None:
+                            ts_utc = recorded_at.replace(tzinfo=timezone.utc)
+                        else:
+                            ts_utc = recorded_at.astimezone(timezone.utc)
+
+                        dim_crypto_rows.append((crypto_id, symbol, name, slug, last_updated))
+                        timestamps.append(ts_utc)
+                        fact_rows.append(
+                            (
+                                crypto_id,
+                                ts_utc,
+                                metric_id,
+                                r[7],
+                                r[8],
+                                r[9],
+                                r[10],
+                                r[11],
+                                r[12],
+                                r[13],
+                                r[14],
+                                r[15],
+                            )
+                        )
+
+                    if not fact_rows:
+                        continue
+
+                    dim_upsert_sql = f"""
+                    INSERT INTO {DW_SCHEMA}.dim_crypto (crypto_id, symbol, name, slug, last_updated)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (crypto_id) DO UPDATE SET
+                      symbol = EXCLUDED.symbol,
+                      name = EXCLUDED.name,
+                      slug = EXCLUDED.slug,
+                      last_updated = EXCLUDED.last_updated
+                    """
+
+                    with conn.cursor() as cur2:
+                        cur2.executemany(dim_upsert_sql, dim_crypto_rows)
+
+                    _ensure_dim_time(conn, timestamps, commit=False)
+
+                    with conn.cursor() as cur2:
+                        time_map = _fetch_mapping_any(cur2, "dim_time", "ts_utc", "time_key", timestamps)
+
+                        insert_rows: List[Tuple[Any, ...]] = []
+                        for (
+                            crypto_id,
+                            ts_utc,
+                            metric_id,
+                            price_usd,
+                            volume_24h,
+                            market_cap,
+                            pc_1h,
+                            pc_24h,
+                            pc_7d,
+                            circulating_supply,
+                            total_supply,
+                            max_supply,
+                        ) in fact_rows:
+                            time_key = time_map.get(ts_utc)
+                            if not time_key:
+                                continue
+                            insert_rows.append(
+                                (
+                                    crypto_id,
+                                    time_key,
+                                    metric_id,
+                                    price_usd,
+                                    volume_24h,
+                                    market_cap,
+                                    pc_1h,
+                                    pc_24h,
+                                    pc_7d,
+                                    circulating_supply,
+                                    total_supply,
+                                    max_supply,
+                                )
+                            )
+
+                        if not insert_rows:
+                            continue
+
+                        fact_sql = f"""
+                        INSERT INTO {DW_SCHEMA}.fact_crypto_market_snapshot (
+                          crypto_id, time_key, staged_metric_id,
+                          price_usd, volume_24h, market_cap,
+                          percent_change_1h, percent_change_24h, percent_change_7d,
+                          circulating_supply, total_supply, max_supply
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (crypto_id, time_key) DO UPDATE SET
+                          staged_metric_id = EXCLUDED.staged_metric_id,
+                          price_usd = EXCLUDED.price_usd,
+                          volume_24h = EXCLUDED.volume_24h,
+                          market_cap = EXCLUDED.market_cap,
+                          percent_change_1h = EXCLUDED.percent_change_1h,
+                          percent_change_24h = EXCLUDED.percent_change_24h,
+                          percent_change_7d = EXCLUDED.percent_change_7d,
+                          circulating_supply = EXCLUDED.circulating_supply,
+                          total_supply = EXCLUDED.total_supply,
+                          max_supply = EXCLUDED.max_supply
+                        """
+                        cur2.executemany(fact_sql, insert_rows)
+                        stats["inserted_or_updated"] += len(insert_rows)
+
+                    conn.commit()
+
+            if stats["inserted_or_updated"] == 0:
+                raise AirflowSkipException("No new CoinMarketCap metrics to load.")
+
+            stats["new_checkpoint_id"] = last_id
+            return stats
+        finally:
+            conn.close()
+
+    @task
+    def update_coinmarketcap_checkpoint(stats: Dict[str, Any]) -> Dict[str, Any]:
+        previous = stats.get("checkpoint_id")
+        new_val = stats.get("new_checkpoint_id")
+        try:
+            prev_int = int(previous) if previous is not None else 0
+        except (TypeError, ValueError):
+            prev_int = 0
+        try:
+            new_int = int(new_val) if new_val is not None else prev_int
+        except (TypeError, ValueError):
+            new_int = prev_int
+        if new_int > prev_int:
+            Variable.set(CHECKPOINT_CMC_VAR, str(new_int))
+            return {"checkpoint_id": new_int}
+        return {"checkpoint_id": prev_int}
+
     @task(trigger_rule="all_done")
     def log_summary(
         binance_stats: Dict[str, Any],
         etherscan_stats: Dict[str, Any],
         binance_checkpoint: Dict[str, Any],
         etherscan_checkpoint: Dict[str, Any],
+        cmc_stats: Dict[str, Any],
+        cmc_checkpoint: Dict[str, Any],
     ) -> None:
         print("=" * 60)
         print("Pipeline 3 (Production / Data Warehouse) Summary:")
         print("=" * 60)
         print(f"Binance: {binance_stats}")
         print(f"Ethereum: {etherscan_stats}")
+        print(f"CoinMarketCap: {cmc_stats}")
         print(f"Binance checkpoint: {binance_checkpoint}")
         print(f"Ethereum checkpoint: {etherscan_checkpoint}")
+        print(f"CoinMarketCap checkpoint: {cmc_checkpoint}")
         print("=" * 60)
         print("Star Schema in postgres-data:dw erfolgreich aktualisiert!")
         print("=" * 60)
@@ -821,7 +1084,26 @@ def pipeline_3_production():
     binance_stats >> binance_checkpoint
     etherscan_stats >> etherscan_checkpoint
 
-    log_summary(binance_stats, etherscan_stats, binance_checkpoint, etherscan_checkpoint)
+    cmc_stats = load_coinmarketcap_metrics(settings)
+    created >> cmc_stats
+    cmc_checkpoint = update_coinmarketcap_checkpoint(cmc_stats)
+    cmc_stats >> cmc_checkpoint
+
+    log_summary(
+        binance_stats,
+        etherscan_stats,
+        binance_checkpoint,
+        etherscan_checkpoint,
+        cmc_stats,
+        cmc_checkpoint,
+    )
+
+    publish_dw_dataset = EmptyOperator(
+        task_id="publish_dw_dataset",
+        outlets=[DW_DATASET],
+        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+    )
+    [binance_stats, etherscan_stats, cmc_stats] >> publish_dw_dataset
 
 
 pipeline_3_production()

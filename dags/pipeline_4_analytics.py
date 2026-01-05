@@ -14,6 +14,8 @@ except ModuleNotFoundError:
 from airflow.exceptions import AirflowSkipException
 from airflow.models import Variable
 
+from pipeline_datasets import DW_DATASET
+
 DEFAULT_PG_HOST = "postgres-data"
 DEFAULT_PG_PORT = 5432
 DEFAULT_PG_DB = "datadb"
@@ -28,6 +30,8 @@ DEFAULT_BINANCE_INTERVAL = "1m"
 DEFAULT_EXCHANGE_NAME = "Binance"
 DEFAULT_CHAIN_NAME = "Ethereum"
 DEFAULT_OUTPUT_DIR = "/opt/airflow/data/analysis/eth_price_vs_gas_fee"
+DEFAULT_CMC_TOP_N = 10
+DEFAULT_CMC_BASE_SYMBOL = "ETH"
 
 
 @dataclass(frozen=True)
@@ -70,7 +74,7 @@ def _pg_connect(settings: Settings):
 
 @dag(
     start_date=pendulum.datetime(2025, 10, 1, tz="Europe/Paris"),
-    schedule="@daily",
+    schedule=[DW_DATASET],
     catchup=False,
     tags=["pipeline-4", "analytics", "analysis", "correlation"],
     default_args=dict(retries=2, retry_delay=pendulum.duration(minutes=2)),
@@ -99,6 +103,7 @@ def pipeline_4_analytics():
         )
         chain_name = Variable.get("ANALYSIS_CHAIN_NAME", default_var=DEFAULT_CHAIN_NAME)
         output_dir = Variable.get("ANALYSIS_OUTPUT_DIR", default_var=DEFAULT_OUTPUT_DIR)
+        cmc_base_symbol = Variable.get("ANALYSIS_CMC_BASE_SYMBOL", default_var=DEFAULT_CMC_BASE_SYMBOL)
 
         try:
             pg_port = int(pg_port_raw)
@@ -122,7 +127,277 @@ def pipeline_4_analytics():
             chain_name=str(chain_name).strip(),
             output_dir=str(output_dir).strip(),
         )
-        return settings.__dict__
+        # stash extra config alongside settings without expanding the dataclass
+        d = settings.__dict__
+        d["cmc_base_symbol"] = str(cmc_base_symbol).strip().upper()
+        return d
+
+    @task
+    def run_coinmarketcap_analysis(settings_dict: Dict[str, Any]) -> Dict[str, Any]:
+        settings = Settings(**settings_dict)
+        conn = _pg_connect(settings)
+        try:
+            top_n_raw = Variable.get("ANALYSIS_CMC_TOP_N", default_var=str(DEFAULT_CMC_TOP_N))
+            try:
+                top_n = max(1, int(top_n_raw))
+            except ValueError:
+                top_n = DEFAULT_CMC_TOP_N
+
+            with conn.cursor() as cur:
+                cur.execute(f"CREATE SCHEMA IF NOT EXISTS {DW_SCHEMA};")
+                cur.execute("SELECT to_regclass(%s)", (f"{DW_SCHEMA}.fact_crypto_market_snapshot",))
+                fact_reg = cur.fetchone()[0]
+                cur.execute("SELECT to_regclass(%s)", (f"{DW_SCHEMA}.dim_crypto",))
+                dim_reg = cur.fetchone()[0]
+                if not fact_reg or not dim_reg:
+                    raise AirflowSkipException(
+                        f"Missing DW tables for CoinMarketCap ({DW_SCHEMA}.fact_crypto_market_snapshot / {DW_SCHEMA}.dim_crypto)."
+                    )
+
+                cur.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {DW_SCHEMA}.analysis_coinmarketcap_top_assets (
+                      snapshot_ts TIMESTAMP NOT NULL,
+                      rank INTEGER NOT NULL,
+                      crypto_id INTEGER NOT NULL,
+                      symbol TEXT NOT NULL,
+                      name TEXT NOT NULL,
+                      price_usd NUMERIC,
+                      volume_24h NUMERIC,
+                      market_cap NUMERIC,
+                      percent_change_24h NUMERIC,
+                      computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                      PRIMARY KEY (snapshot_ts, crypto_id)
+                    );
+                    """
+                )
+            conn.commit()
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    WITH latest_per_crypto AS (
+                      SELECT crypto_id, MAX(time_key) AS time_key
+                      FROM {DW_SCHEMA}.fact_crypto_market_snapshot
+                      GROUP BY 1
+                    ),
+                    snapshot AS (
+                      SELECT
+                        t.ts_utc AS snapshot_ts,
+                        ROW_NUMBER() OVER (
+                          ORDER BY f.market_cap DESC NULLS LAST,
+                                   f.volume_24h DESC NULLS LAST,
+                                   d.symbol
+                        ) AS rank,
+                        d.crypto_id,
+                        d.symbol,
+                        d.name,
+                        f.price_usd,
+                        f.volume_24h,
+                        f.market_cap,
+                        f.percent_change_24h
+                      FROM latest_per_crypto l
+                      JOIN {DW_SCHEMA}.fact_crypto_market_snapshot f
+                        ON f.crypto_id = l.crypto_id AND f.time_key = l.time_key
+                      JOIN {DW_SCHEMA}.dim_time t ON t.time_key = f.time_key
+                      JOIN {DW_SCHEMA}.dim_crypto d ON d.crypto_id = f.crypto_id
+                      ORDER BY f.market_cap DESC NULLS LAST, f.volume_24h DESC NULLS LAST, d.symbol
+                      LIMIT %(top_n)s
+                    )
+                    INSERT INTO {DW_SCHEMA}.analysis_coinmarketcap_top_assets (
+                      snapshot_ts, rank, crypto_id, symbol, name,
+                      price_usd, volume_24h, market_cap, percent_change_24h
+                    )
+                    SELECT
+                      snapshot_ts, rank, crypto_id, symbol, name,
+                      price_usd, volume_24h, market_cap, percent_change_24h
+                    FROM snapshot
+                    ON CONFLICT (snapshot_ts, crypto_id) DO UPDATE SET
+                      rank = EXCLUDED.rank,
+                      symbol = EXCLUDED.symbol,
+                      name = EXCLUDED.name,
+                      price_usd = EXCLUDED.price_usd,
+                      volume_24h = EXCLUDED.volume_24h,
+                      market_cap = EXCLUDED.market_cap,
+                      percent_change_24h = EXCLUDED.percent_change_24h,
+                      computed_at = NOW()
+                    """,
+                    {"top_n": top_n},
+                )
+                cur.execute(
+                    f"""
+                    SELECT snapshot_ts, COUNT(*) AS n_rows
+                    FROM {DW_SCHEMA}.analysis_coinmarketcap_top_assets
+                    GROUP BY 1
+                    ORDER BY snapshot_ts DESC
+                    LIMIT 1
+                    """
+                )
+                row = cur.fetchone()
+            conn.commit()
+
+            if not row:
+                raise AirflowSkipException("CoinMarketCap analysis produced no rows.")
+
+            return {
+                "table": f"{DW_SCHEMA}.analysis_coinmarketcap_top_assets",
+                "snapshot_ts": str(row[0]),
+                "top_n": top_n,
+                "rows_in_snapshot": int(row[1]),
+            }
+        finally:
+            conn.close()
+
+    @task
+    def run_integrated_daily_analysis(settings_dict: Dict[str, Any]) -> Dict[str, Any]:
+        settings = Settings(**settings_dict)
+        base_symbol = str(settings_dict.get("cmc_base_symbol") or DEFAULT_CMC_BASE_SYMBOL).strip().upper()
+
+        conn = _pg_connect(settings)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"CREATE SCHEMA IF NOT EXISTS {DW_SCHEMA};")
+                cur.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {DW_SCHEMA}.analysis_integrated_daily (
+                      trading_date DATE PRIMARY KEY,
+                      base_symbol TEXT NOT NULL,
+                      cmc_price_usd NUMERIC,
+                      cmc_market_cap NUMERIC,
+                      binance_avg_close_usdt NUMERIC,
+                      binance_avg_volume_usdt NUMERIC,
+                      eth_avg_base_fee_gwei NUMERIC,
+                      computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+            conn.commit()
+
+            window_end = pendulum.now("UTC")
+            window_start = window_end.subtract(days=settings.lookback_days)
+
+            params = {
+                "base_symbol": base_symbol,
+                "exchange_name": settings.exchange_name,
+                "asset_symbol": settings.asset_symbol,
+                "binance_interval": settings.binance_interval,
+                "chain_name": settings.chain_name,
+                "window_start": window_start,
+                "window_end": window_end,
+            }
+
+            upsert_sql = f"""
+            WITH
+            cmc_crypto AS (
+              SELECT crypto_id
+              FROM {DW_SCHEMA}.dim_crypto
+              WHERE symbol = %(base_symbol)s
+              LIMIT 1
+            ),
+            cmc_daily AS (
+              SELECT DISTINCT ON (t.date)
+                t.date AS trading_date,
+                s.price_usd AS cmc_price_usd,
+                s.market_cap AS cmc_market_cap
+              FROM {DW_SCHEMA}.fact_crypto_market_snapshot s
+              JOIN {DW_SCHEMA}.dim_time t ON t.time_key = s.time_key
+              JOIN cmc_crypto c ON c.crypto_id = s.crypto_id
+              WHERE t.ts_utc >= %(window_start)s
+                AND t.ts_utc < %(window_end)s
+              ORDER BY t.date, t.ts_utc DESC
+            ),
+            binance_daily AS (
+              SELECT
+                t.date AS trading_date,
+                AVG(f.close) AS binance_avg_close_usdt,
+                AVG(f.quote_asset_volume) AS binance_avg_volume_usdt
+              FROM {DW_SCHEMA}.fact_binance_candle f
+              JOIN {DW_SCHEMA}.dim_time t ON t.time_key = f.open_time_key
+              JOIN {DW_SCHEMA}.dim_asset a ON a.asset_key = f.asset_key
+              JOIN {DW_SCHEMA}.dim_exchange e ON e.exchange_key = f.exchange_key
+              JOIN {DW_SCHEMA}.dim_interval i ON i.interval_key = f.interval_key
+              WHERE e.exchange_name = %(exchange_name)s
+                AND a.symbol = %(asset_symbol)s
+                AND i.interval = %(binance_interval)s
+                AND f.close IS NOT NULL
+                AND t.ts_utc >= %(window_start)s
+                AND t.ts_utc < %(window_end)s
+              GROUP BY 1
+            ),
+            eth_daily AS (
+              SELECT
+                t.date AS trading_date,
+                AVG(f.base_fee_per_gas::numeric) / 1e9 AS eth_avg_base_fee_gwei
+              FROM {DW_SCHEMA}.fact_ethereum_block f
+              JOIN {DW_SCHEMA}.dim_time t ON t.time_key = f.block_time_key
+              JOIN {DW_SCHEMA}.dim_chain c ON c.chain_key = f.chain_key
+              WHERE c.chain_name = %(chain_name)s
+                AND f.base_fee_per_gas IS NOT NULL
+                AND t.ts_utc >= %(window_start)s
+                AND t.ts_utc < %(window_end)s
+              GROUP BY 1
+            ),
+            joined AS (
+              SELECT
+                COALESCE(b.trading_date, e.trading_date, c.trading_date) AS trading_date,
+                %(base_symbol)s AS base_symbol,
+                c.cmc_price_usd,
+                c.cmc_market_cap,
+                b.binance_avg_close_usdt,
+                b.binance_avg_volume_usdt,
+                e.eth_avg_base_fee_gwei
+              FROM binance_daily b
+              FULL OUTER JOIN eth_daily e USING (trading_date)
+              FULL OUTER JOIN cmc_daily c USING (trading_date)
+            )
+            INSERT INTO {DW_SCHEMA}.analysis_integrated_daily (
+              trading_date, base_symbol,
+              cmc_price_usd, cmc_market_cap,
+              binance_avg_close_usdt, binance_avg_volume_usdt,
+              eth_avg_base_fee_gwei
+            )
+            SELECT
+              trading_date, base_symbol,
+              cmc_price_usd, cmc_market_cap,
+              binance_avg_close_usdt, binance_avg_volume_usdt,
+              eth_avg_base_fee_gwei
+            FROM joined
+            WHERE trading_date IS NOT NULL
+            ON CONFLICT (trading_date) DO UPDATE SET
+              base_symbol = EXCLUDED.base_symbol,
+              cmc_price_usd = EXCLUDED.cmc_price_usd,
+              cmc_market_cap = EXCLUDED.cmc_market_cap,
+              binance_avg_close_usdt = EXCLUDED.binance_avg_close_usdt,
+              binance_avg_volume_usdt = EXCLUDED.binance_avg_volume_usdt,
+              eth_avg_base_fee_gwei = EXCLUDED.eth_avg_base_fee_gwei,
+              computed_at = NOW()
+            """
+
+            with conn.cursor() as cur:
+                cur.execute(upsert_sql, params)
+                cur.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM {DW_SCHEMA}.analysis_integrated_daily
+                    WHERE trading_date >= %(window_start)s::date
+                      AND trading_date < %(window_end)s::date
+                    """,
+                    params,
+                )
+                n_rows = int(cur.fetchone()[0])
+            conn.commit()
+
+            if n_rows < 1:
+                raise AirflowSkipException("Integrated daily analysis produced no rows.")
+
+            return {
+                "table": f"{DW_SCHEMA}.analysis_integrated_daily",
+                "base_symbol": base_symbol,
+                "lookback_days": settings.lookback_days,
+                "rows_in_window": n_rows,
+            }
+        finally:
+            conn.close()
 
     @task
     def run_analysis(settings_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -398,13 +673,22 @@ def pipeline_4_analytics():
             conn.close()
 
     @task(trigger_rule="all_done")
-    def log_summary(result: Dict[str, Any], plot_result: Dict[str, Any]) -> None:
-        print(f"analysis_eth_price_vs_gas_fee: {result} | plot: {plot_result}")
+    def log_summary(
+        result: Dict[str, Any],
+        plot_result: Dict[str, Any],
+        cmc_result: Dict[str, Any],
+        integrated_result: Dict[str, Any],
+    ) -> None:
+        print(
+            f"analysis_eth_price_vs_gas_fee: {result} | plot: {plot_result} | cmc: {cmc_result} | integrated: {integrated_result}"
+        )
 
     settings = get_settings()
     result = run_analysis(settings)
     plot_result = create_plot(settings, result)
-    log_summary(result, plot_result)
+    cmc_result = run_coinmarketcap_analysis(settings)
+    integrated_result = run_integrated_daily_analysis(settings)
+    log_summary(result, plot_result, cmc_result, integrated_result)
 
 
 pipeline_4_analytics()

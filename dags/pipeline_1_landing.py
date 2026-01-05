@@ -27,6 +27,10 @@ except ModuleNotFoundError:
     from airflow.decorators import dag, task
 from airflow.exceptions import AirflowSkipException
 from airflow.models import Variable
+from airflow.operators.empty import EmptyOperator
+from airflow.utils.trigger_rule import TriggerRule
+
+from pipeline_datasets import LANDING_DATASET
 
 # Input directories (from API ingestion or manually placed)
 BINANCE_INPUT_DIR = Path("/opt/airflow/dags/data/binance_klines")
@@ -156,9 +160,13 @@ def pipeline_1_landing():
         client = MongoClient(mongo_uri)
         collection = client[mongo_db][collection_name]
         collection.create_index([("symbol", 1), ("interval", 1), ("open_time_ms", 1)], unique=True)
+        collection.create_index("ingested_at")
+        collection.create_index("updated_at")
 
         stats = {"files_processed": 0, "rows_loaded": 0, "rows_skipped": 0}
         batch: List[UpdateOne] = []
+        ingested_at = pendulum.now("UTC").to_iso8601_string()
+        updated_at = ingested_at
 
         for file_path in files:
             try:
@@ -186,7 +194,20 @@ def pipeline_1_landing():
                                 "open_time_ms": doc["open_time_ms"],
                             }
 
-                            batch.append(UpdateOne(key, {"$set": doc}, upsert=True))
+                            batch.append(
+                                UpdateOne(
+                                    key,
+                                    {
+                                        "$set": {**doc, "updated_at": updated_at},
+                                        "$setOnInsert": {
+                                            "ingested_at": ingested_at,
+                                            "ingestion_ds": ds,
+                                            "source_file": file_path.name,
+                                        },
+                                    },
+                                    upsert=True,
+                                )
+                            )
                             stats["rows_loaded"] += 1
 
                             if len(batch) >= batch_size:
@@ -231,9 +252,13 @@ def pipeline_1_landing():
         collection = client[mongo_db][collection_name]
         collection.create_index("hash", unique=True, sparse=True)
         collection.create_index("number", unique=True, sparse=True)
+        collection.create_index("ingested_at")
+        collection.create_index("updated_at")
 
         stats = {"files_processed": 0, "blocks_loaded": 0, "blocks_skipped": 0}
         operations: List[UpdateOne] = []
+        ingested_at = pendulum.now("UTC").to_iso8601_string()
+        updated_at = ingested_at
 
         for file_path in files:
             try:
@@ -267,12 +292,23 @@ def pipeline_1_landing():
                                 "timestamp_unix": ts_unix,
                                 "tx_count": len(block.get("transactions") or []),
                                 "raw": block,
-                                "ingestion_ds": ds,
-                                "ingested_at": pendulum.now("UTC").to_iso8601_string(),
                             }
 
                             key = {"hash": block_hash}
-                            operations.append(UpdateOne(key, {"$set": doc}, upsert=True))
+                            operations.append(
+                                UpdateOne(
+                                    key,
+                                    {
+                                        "$set": {**doc, "updated_at": updated_at},
+                                        "$setOnInsert": {
+                                            "ingestion_ds": ds,
+                                            "ingested_at": ingested_at,
+                                            "source_file": file_path.name,
+                                        },
+                                    },
+                                    upsert=True,
+                                )
+                            )
                             stats["blocks_loaded"] += 1
 
                         except (json.JSONDecodeError, ValueError):
@@ -388,6 +424,13 @@ def pipeline_1_landing():
     cmc_stats >> cmc_cleanup
 
     log_summary(binance_stats, etherscan_stats, cmc_stats)
+
+    publish_landing_dataset = EmptyOperator(
+        task_id="publish_landing_dataset",
+        outlets=[LANDING_DATASET],
+        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+    )
+    [binance_stats, etherscan_stats, cmc_stats] >> publish_landing_dataset
 
 
 pipeline_1_landing()

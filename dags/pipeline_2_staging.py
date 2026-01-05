@@ -29,6 +29,10 @@ except ModuleNotFoundError:
     from airflow.decorators import dag, task
 from airflow.exceptions import AirflowSkipException
 from airflow.models import Variable
+from airflow.operators.empty import EmptyOperator
+from airflow.utils.trigger_rule import TriggerRule
+
+from pipeline_datasets import LANDING_DATASET, STAGING_DATASET
 
 # MongoDB defaults (Landing Zone)
 DEFAULT_MONGO_URI = "mongodb://root:example@mongodb:27017"
@@ -123,7 +127,7 @@ def _parse_hex_int(value: Any) -> Optional[int]:
 
 @dag(
     start_date=pendulum.datetime(2025, 10, 1, tz="Europe/Paris"),
-    schedule="*/20 * * * *",  # every 20 minutes
+    schedule=[LANDING_DATASET],
     catchup=False,
     tags=["pipeline-2", "staging", "transformation"],
     default_args=dict(retries=2, retry_delay=pendulum.duration(minutes=2)),
@@ -238,7 +242,7 @@ def pipeline_2_staging():
         """Binance: MongoDB → Postgres staging with cleaning."""
         query: Dict[str, Any] = {}
         if checkpoint:
-            query = {"ingested_at": {"$gt": checkpoint}}
+            query = {"$or": [{"updated_at": {"$gt": checkpoint}}, {"ingested_at": {"$gt": checkpoint}}]}
 
         mongo_uri = Variable.get("MONGO_URI", default_var=DEFAULT_MONGO_URI)
         mongo_db = Variable.get("MONGO_DB", default_var=DEFAULT_MONGO_DB)
@@ -251,10 +255,10 @@ def pipeline_2_staging():
 
         stats = {"seen": 0, "valid": 0, "invalid": 0, "inserted": 0, "checkpoint": checkpoint}
         batch: List[Dict[str, Any]] = []
-        last_ingested_at: Optional[str] = checkpoint
+        last_event_at: Optional[str] = checkpoint
 
         try:
-            cursor = coll.find(query).sort("ingested_at", 1)
+            cursor = coll.find(query).sort([("updated_at", 1), ("ingested_at", 1)])
 
             for doc in cursor:
                 stats["seen"] += 1
@@ -308,9 +312,9 @@ def pipeline_2_staging():
                     batch.append(cleaned)
                     stats["valid"] += 1
 
-                    ia = doc.get("ingested_at")
-                    if isinstance(ia, str):
-                        last_ingested_at = ia
+                    event_at = doc.get("updated_at") or doc.get("ingested_at")
+                    if isinstance(event_at, str):
+                        last_event_at = event_at
 
                 except (KeyError, TypeError, ValueError):
                     stats["invalid"] += 1
@@ -327,7 +331,7 @@ def pipeline_2_staging():
             if stats["inserted"] == 0:
                 raise AirflowSkipException("Keine neuen Binance-Daten")
 
-            stats["new_checkpoint"] = last_ingested_at
+            stats["new_checkpoint"] = last_event_at
 
             return stats
 
@@ -383,7 +387,7 @@ def pipeline_2_staging():
         """Ethereum: MongoDB → Postgres staging with cleaning."""
         query: Dict[str, Any] = {}
         if checkpoint:
-            query = {"ingested_at": {"$gt": checkpoint}}
+            query = {"$or": [{"updated_at": {"$gt": checkpoint}}, {"ingested_at": {"$gt": checkpoint}}]}
 
         mongo_uri = Variable.get("MONGO_URI", default_var=DEFAULT_MONGO_URI)
         mongo_db = Variable.get("MONGO_DB", default_var=DEFAULT_MONGO_DB)
@@ -396,10 +400,10 @@ def pipeline_2_staging():
 
         stats = {"seen": 0, "valid": 0, "invalid": 0, "inserted": 0, "checkpoint": checkpoint}
         batch: List[Dict[str, Any]] = []
-        last_ingested_at: Optional[str] = checkpoint
+        last_event_at: Optional[str] = checkpoint
 
         try:
-            cursor = coll.find(query).sort("ingested_at", 1)
+            cursor = coll.find(query).sort([("updated_at", 1), ("ingested_at", 1)])
 
             for doc in cursor:
                 stats["seen"] += 1
@@ -442,9 +446,9 @@ def pipeline_2_staging():
                     batch.append(cleaned)
                     stats["valid"] += 1
 
-                    ia = doc.get("ingested_at")
-                    if isinstance(ia, str):
-                        last_ingested_at = ia
+                    event_at = doc.get("updated_at") or doc.get("ingested_at")
+                    if isinstance(event_at, str):
+                        last_event_at = event_at
 
                 except (KeyError, TypeError, ValueError):
                     stats["invalid"] += 1
@@ -460,7 +464,7 @@ def pipeline_2_staging():
             if stats["inserted"] == 0:
                 raise AirflowSkipException("Keine neuen Ethereum-Blöcke")
 
-            stats["new_checkpoint"] = last_ingested_at
+            stats["new_checkpoint"] = last_event_at
 
             return stats
 
@@ -725,6 +729,13 @@ def pipeline_2_staging():
     cmc_checkpoint = update_coinmarketcap_checkpoint(cmc_stats)
 
     log_summary(binance_stats, ethereum_stats, cmc_stats, binance_checkpoint, ethereum_checkpoint, cmc_checkpoint)
+
+    publish_staging_dataset = EmptyOperator(
+        task_id="publish_staging_dataset",
+        outlets=[STAGING_DATASET],
+        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+    )
+    [binance_stats, ethereum_stats, cmc_stats] >> publish_staging_dataset
 
 
 pipeline_2_staging()
