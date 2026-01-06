@@ -493,5 +493,5 @@ This project is licensed under the terms of the license in [LICENSE](LICENSE).
 Repository authors / contributors (add missing team members here):
 
 - Janis Peters
-- 
+- Ana Luisa Girio Berlingieri
 - 

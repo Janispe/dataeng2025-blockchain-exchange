@@ -112,3 +112,7 @@ out/
 *.zip
 *.rar
 *.7z
+
+data/analysis/
+data/*.csv
+data/*.csv.gz
