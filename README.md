@@ -468,41 +468,6 @@ Configuration options in [.env](.env) include service ports, database credential
 └── README.md                   # This file
 ```
 
-## Development & Troubleshooting
-
-### Common Issues
-
-**Permission errors on `./data` directory:**
-- Set `AIRFLOW_INIT_CHOWN_DATA=true` in `.env`
-- Restart: `docker compose down && docker compose up -d`
-
-**Pipeline not triggering:**
-- Check Airflow UI → Datasets to see if datasets are being updated
-- Verify previous pipeline completed successfully
-- Check Airflow logs for errors
-
-**MongoDB connection errors:**
-- Verify MongoDB is running: `docker compose ps`
-- Check connection string in Airflow Variables
-- Review MongoDB logs: `docker compose logs mongodb`
-
-### Monitoring
-
-The Airflow UI provides DAG execution status, task logs, and dataset lineage visualization. Database administration interfaces include pgAdmin for PostgreSQL and Mongo Express for MongoDB.
-
-### Cleanup
-
-Stop and remove all containers:
-```bash
-docker compose down
-```
-
-Remove all data (destructive):
-```bash
-docker compose down -v
-rm -rf ./data ./dags/data
-```
-
 ## Additional Resources
 
 ### Data Sources
