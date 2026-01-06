@@ -331,20 +331,39 @@ def main():
                     pass
 
         with col2:
-            st.subheader("Integrated Daily (CMC vs Binance vs Ethereum)")
-            with st.spinner("Loading integrated daily analysis..."):
+            st.subheader("Integrated (CMC vs Binance vs Ethereum)")
+            granularity = st.radio(
+                "Granularity",
+                ["Daily", "10-minute"],
+                horizontal=True,
+                key="integrated_granularity",
+            )
+
+            with st.spinner("Loading integrated analysis..."):
                 try:
-                    integrated_df = utils.fetch_integrated_daily_data(
-                        start_date=str(start_date),
-                        end_date=str(end_date),
-                        _conn=conn,
-                    )
+                    if granularity == "Daily":
+                        integrated_df = utils.fetch_integrated_daily_data(
+                            start_date=str(start_date),
+                            end_date=str(end_date),
+                            _conn=conn,
+                        )
+                        ts_col = "trading_date"
+                    else:
+                        integrated_df = utils.fetch_integrated_10m_data(
+                            start_date=str(start_date),
+                            end_date=str(end_date),
+                            _conn=conn,
+                        )
+                        ts_col = "bucket_ts"
                 except Exception as e:
                     integrated_df = pd.DataFrame()
-                    st.error(f"Error loading integrated daily analysis: {e}")
+                    st.error(f"Error loading integrated analysis: {e}")
 
             if integrated_df.empty:
-                st.info("No integrated daily data found. Run `pipeline_4_analytics` to populate `dw.analysis_integrated_daily`.")
+                if granularity == "Daily":
+                    st.info("No integrated daily data found. Run `pipeline_4_analytics` to populate `dw.analysis_integrated_daily`.")
+                else:
+                    st.info("No integrated 10-minute data found. Ensure DW tables are populated (Binance/Ethereum/CMC).")
             else:
                 base_symbol = "N/A"
                 if "base_symbol" in integrated_df.columns:
@@ -359,7 +378,7 @@ def main():
                     fig_price = go.Figure()
                     fig_price.add_trace(
                         go.Scatter(
-                            x=integrated_df["trading_date"],
+                            x=integrated_df[ts_col],
                             y=integrated_df["cmc_price_usd"],
                             name="CMC Price (USD)",
                             mode="lines+markers",
@@ -367,15 +386,15 @@ def main():
                     )
                     fig_price.add_trace(
                         go.Scatter(
-                            x=integrated_df["trading_date"],
+                            x=integrated_df[ts_col],
                             y=integrated_df["binance_avg_close_usdt"],
                             name="Binance Avg Close (USDT)",
                             mode="lines+markers",
                         )
                     )
                     fig_price.update_layout(
-                        title="CMC vs Binance Price (Daily)",
-                        xaxis_title="Date",
+                        title=f"CMC vs Binance Price ({granularity})",
+                        xaxis_title="Time",
                         yaxis_title="Price",
                         height=350,
                         hovermode="x unified",
@@ -385,7 +404,7 @@ def main():
                     fig_fee = go.Figure(
                         data=[
                             go.Scatter(
-                                x=integrated_df["trading_date"],
+                                x=integrated_df[ts_col],
                                 y=integrated_df["eth_avg_base_fee_gwei"],
                                 name="ETH Avg Base Fee (gwei)",
                                 mode="lines+markers",
@@ -393,8 +412,8 @@ def main():
                         ]
                     )
                     fig_fee.update_layout(
-                        title="Ethereum Base Fee (Daily)",
-                        xaxis_title="Date",
+                        title=f"Ethereum Base Fee ({granularity})",
+                        xaxis_title="Time",
                         yaxis_title="Base Fee (gwei)",
                         height=300,
                         hovermode="x unified",
@@ -403,23 +422,42 @@ def main():
                 except Exception:
                     pass
 
-                display_df = integrated_df[[
-                    "trading_date",
-                    "cmc_price_usd",
-                    "cmc_market_cap",
-                    "binance_avg_close_usdt",
-                    "binance_avg_volume_usdt",
-                    "eth_avg_base_fee_gwei",
-                ]].copy()
-                display_df["trading_date"] = display_df["trading_date"].dt.strftime("%Y-%m-%d")
-                display_df.columns = [
-                    "Date",
-                    "CMC Price (USD)",
-                    "CMC Market Cap (USD)",
-                    "Binance Avg Close (USDT)",
-                    "Binance Avg Volume (USDT)",
-                    "ETH Avg Base Fee (gwei)",
-                ]
+                if granularity == "Daily":
+                    display_df = integrated_df[[
+                        "trading_date",
+                        "cmc_price_usd",
+                        "cmc_market_cap",
+                        "binance_avg_close_usdt",
+                        "binance_avg_volume_usdt",
+                        "eth_avg_base_fee_gwei",
+                    ]].copy()
+                    display_df["trading_date"] = display_df["trading_date"].dt.strftime("%Y-%m-%d")
+                    display_df.columns = [
+                        "Date",
+                        "CMC Price (USD)",
+                        "CMC Market Cap (USD)",
+                        "Binance Avg Close (USDT)",
+                        "Binance Avg Volume (USDT)",
+                        "ETH Avg Base Fee (gwei)",
+                    ]
+                else:
+                    display_df = integrated_df[[
+                        "bucket_ts",
+                        "cmc_price_usd",
+                        "cmc_market_cap",
+                        "binance_avg_close_usdt",
+                        "binance_avg_volume_usdt",
+                        "eth_avg_base_fee_gwei",
+                    ]].copy()
+                    display_df["bucket_ts"] = display_df["bucket_ts"].dt.strftime("%Y-%m-%d %H:%M")
+                    display_df.columns = [
+                        "Time (UTC)",
+                        "CMC Price (USD)",
+                        "CMC Market Cap (USD)",
+                        "Binance Avg Close (USDT)",
+                        "Binance Avg Volume (USDT)",
+                        "ETH Avg Base Fee (gwei)",
+                    ]
                 st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     with tabs[4]:

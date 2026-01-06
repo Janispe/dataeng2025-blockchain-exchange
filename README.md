@@ -468,19 +468,8 @@ rm -rf ./data ./dags/data
 - **Apache Airflow**: https://airflow.apache.org/
 - **MongoDB**: https://docs.mongodb.com/
 - **PostgreSQL**: https://www.postgresql.org/docs/
+- **Redis**: https://redis.io/docs/latest/
 - **Streamlit**: https://docs.streamlit.io/
-
-## 📋 Course Requirements
-
-This project fulfills the requirements from the Data Engineering course at INSA:
-- ✅ Repository with complete code and documentation
-- ✅ `docker-compose` setup for easy deployment
-- ✅ Detailed architecture description and pipeline documentation
-- ✅ Comprehensive README with design decisions and setup guide
-- ✅ Sample dataset for offline testing
-- ✅ Automated data pipelines with proper orchestration
-
-Course information: https://www.riccardotommasini.com/courses/dataeng-insa-ot/
 
 ## 📄 License
 

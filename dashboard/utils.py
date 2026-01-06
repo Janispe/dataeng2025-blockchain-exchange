@@ -367,6 +367,119 @@ def fetch_integrated_daily_data(
     return df
 
 
+@st.cache_data(ttl=300)
+@redis_cached("integrated_10m", ttl=300)
+def fetch_integrated_10m_data(
+    start_date: str,
+    end_date: str,
+    base_symbol: str = "ETH",
+    exchange_name: str = "Binance",
+    asset_symbol: str = "ETHUSDT",
+    binance_interval: str = "1m",
+    chain_name: str = "Ethereum",
+    bucket_minutes: int = 10,
+    _conn: Optional[Any] = None,
+) -> pd.DataFrame:
+    """Compute integrated 10-minute buckets (CMC vs Binance vs Ethereum) on the fly."""
+    if _conn is None:
+        _conn = get_db_connection()
+
+    query = """
+        WITH
+        binance_10m AS (
+          SELECT
+            date_trunc('minute', t.ts_utc)
+              - INTERVAL '1 minute' * (EXTRACT(minute FROM t.ts_utc)::int %% %(bucket_minutes)s) AS bucket_ts,
+            AVG(f.close) AS binance_avg_close_usdt,
+            AVG(f.quote_asset_volume) AS binance_avg_volume_usdt
+          FROM dw.fact_binance_candle f
+          JOIN dw.dim_time t ON t.time_key = f.open_time_key
+          JOIN dw.dim_asset a ON a.asset_key = f.asset_key
+          JOIN dw.dim_exchange e ON e.exchange_key = f.exchange_key
+          JOIN dw.dim_interval i ON i.interval_key = f.interval_key
+          WHERE e.exchange_name = %(exchange_name)s
+            AND a.symbol = %(asset_symbol)s
+            AND i.interval = %(binance_interval)s
+            AND f.close IS NOT NULL
+            AND t.ts_utc >= %(start_ts)s
+            AND t.ts_utc < %(end_ts)s
+          GROUP BY 1
+        ),
+        eth_10m AS (
+          SELECT
+            date_trunc('minute', t.ts_utc)
+              - INTERVAL '1 minute' * (EXTRACT(minute FROM t.ts_utc)::int %% %(bucket_minutes)s) AS bucket_ts,
+            AVG(f.base_fee_per_gas::numeric) / 1e9 AS eth_avg_base_fee_gwei
+          FROM dw.fact_ethereum_block f
+          JOIN dw.dim_time t ON t.time_key = f.block_time_key
+          JOIN dw.dim_chain c ON c.chain_key = f.chain_key
+          WHERE c.chain_name = %(chain_name)s
+            AND f.base_fee_per_gas IS NOT NULL
+            AND t.ts_utc >= %(start_ts)s
+            AND t.ts_utc < %(end_ts)s
+          GROUP BY 1
+        ),
+        buckets AS (
+          SELECT bucket_ts FROM binance_10m
+          UNION
+          SELECT bucket_ts FROM eth_10m
+        ),
+        cmc_crypto AS (
+          SELECT crypto_id
+          FROM dw.dim_crypto
+          WHERE symbol = %(base_symbol)s
+          LIMIT 1
+        ),
+        cmc_snapshots AS (
+          SELECT
+            t.ts_utc AS snapshot_ts,
+            s.price_usd,
+            s.market_cap
+          FROM dw.fact_crypto_market_snapshot s
+          JOIN dw.dim_time t ON t.time_key = s.time_key
+          JOIN cmc_crypto c ON c.crypto_id = s.crypto_id
+          WHERE t.ts_utc < %(end_ts)s
+        )
+        SELECT
+          b.bucket_ts,
+          %(base_symbol)s AS base_symbol,
+          cmc.price_usd AS cmc_price_usd,
+          cmc.market_cap AS cmc_market_cap,
+          bn.binance_avg_close_usdt,
+          bn.binance_avg_volume_usdt,
+          e.eth_avg_base_fee_gwei
+        FROM buckets b
+        LEFT JOIN binance_10m bn USING (bucket_ts)
+        LEFT JOIN eth_10m e USING (bucket_ts)
+        LEFT JOIN LATERAL (
+          SELECT cs.price_usd, cs.market_cap
+          FROM cmc_snapshots cs
+          WHERE cs.snapshot_ts <= b.bucket_ts
+          ORDER BY cs.snapshot_ts DESC
+          LIMIT 1
+        ) cmc ON TRUE
+        WHERE b.bucket_ts >= %(start_ts)s
+          AND b.bucket_ts < %(end_ts)s
+        ORDER BY b.bucket_ts
+    """
+
+    params = {
+        "start_ts": start_date,
+        "end_ts": end_date,
+        "base_symbol": str(base_symbol).strip().upper(),
+        "exchange_name": str(exchange_name).strip(),
+        "asset_symbol": str(asset_symbol).strip().upper(),
+        "binance_interval": str(binance_interval).strip(),
+        "chain_name": str(chain_name).strip(),
+        "bucket_minutes": int(bucket_minutes),
+    }
+
+    df = pd.read_sql(query, _conn, params=params)
+    if not df.empty:
+        df["bucket_ts"] = pd.to_datetime(df["bucket_ts"])
+    return df
+
+
 def create_dual_axis_chart(
     df: pd.DataFrame,
     y1_col: str,
