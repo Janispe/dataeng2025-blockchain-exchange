@@ -1,26 +1,78 @@
-# Blockchain Exchange Data Platform
+# Blockflow
 
 ![INSA Logo](./images/logo-insa_0.png)
 
-A comprehensive data engineering platform for collecting, processing, and analyzing blockchain and cryptocurrency market data using modern data pipeline architectures.
+## Abstract
 
-## 📊 Project Overview
+This project implements an ETL pipeline for cryptocurrency and blockchain data analysis. The system ingests off-chain trading data from Binance, on-chain network metrics from Ethereum via Etherscan, and market snapshots from CoinMarketCap. Data flows through a medallion architecture with four transformation layers: landing (MongoDB/PostgreSQL), staging (PostgreSQL), data warehouse (PostgreSQL star schema), and analytics (aggregations and visualizations(streamlit and redis)). Apache Airflow orchestrates the pipeline using dataset-based dependencies for automatic triggering. The implementation demonstrates practical application of NoSQL document storage for semi-structured data ingestion, relational databases for structured analytics, and dimensional modeling for query optimization.
 
-This project implements a complete data platform that ingests, processes, and analyzes cryptocurrency and blockchain data from multiple sources:
+## Table of Contents
 
-- **Off-chain Market Data**: Trading data and candlestick charts from Binance
-- **On-chain Network Data**: Ethereum blockchain data via Etherscan API
-- **Market Snapshots**: Real-time cryptocurrency metrics from CoinMarketCap
+- [Project Overview](#project-overview)
+- [Architecture](#architecture)
+  - [Design Decisions](#design-decisions)
+  - [Technology Stack](#technology-stack)
+  - [Data Zones](#data-zones)
+- [Data Pipeline](#data-pipeline)
+  - [Pipeline Overview](#pipeline-overview)
+  - [Dataset-Based Triggering](#dataset-based-triggering)
+  - [Data Flow Diagram](#data-flow-diagram)
+  - [Data Warehouse Star Schema](#data-warehouse-star-schema)
+- [Quick Start](#quick-start)
+  - [Prerequisites](#prerequisites)
+  - [Installation](#installation)
+- [Data Ingestion](#data-ingestion)
+- [Analytics & Dashboard](#analytics--dashboard)
+  - [Research Questions](#research-questions)
+  - [Results](#results)
+- [Configuration](#configuration)
+- [Repository Structure](#repository-structure)
+- [Development & Troubleshooting](#development--troubleshooting)
+- [Additional Resources](#additional-resources)
+- [License](#license)
+- [Contributors](#contributors)
 
-The platform follows a **medallion architecture** with 4 automated Airflow pipelines that transform raw data through landing, staging, data warehouse, and analytics layers.
+## Project Overview
 
-## 🏗️ Architecture
+This platform processes cryptocurrency and blockchain data from three primary sources:
+
+- **Off-chain Market Data**: Trading data and candlestick charts from Binance API
+- **On-chain Network Data**: Ethereum blockchain metrics via Etherscan API
+- **Market Snapshots**: Cryptocurrency market metrics from CoinMarketCap API
+
+The architecture implements four automated Airflow pipelines that transform raw data through landing, staging, data warehouse, and analytics layers.
+
+## Architecture
+
+### Design Decisions
+
+**Redis as Message Broker**
+
+Redis serves as the message broker for Airflow's CeleryExecutor, managing the task queue and distributing workload across multiple worker nodes. This architecture enables horizontal scaling and parallel task execution.
+
+**MongoDB for Semi-Structured Data**
+
+MongoDB handles the landing zone for Binance trading data and Ethereum blockchain data. These data sources deliver nested JSON structures with variable schemas that map naturally to document storage. MongoDB's flexible schema accommodates API response variations without requiring migration scripts, which is particularly valuable during the landing phase when data structure exploration is ongoing.
+
+**PostgreSQL for Structured Analytics**
+
+PostgreSQL manages three distinct layers:
+- **Airflow Metadata**: DAG execution history, task states, and configuration
+- **Staging Zone**: Cleaned and validated tabular data with enforced schemas
+- **Data Warehouse**: Star schema implementation for analytical workloads
+
+The transition from MongoDB (landing) to PostgreSQL (staging/warehouse) reflects the progression from exploratory data ingestion to structured analytical processing.
+
+**Star Schema Design**
+
+The data warehouse implements a star schema with dimension tables (time, exchange, asset, chain, crypto) and fact tables (candles, blocks, market snapshots). This denormalized structure optimizes query performance for analytical workloads by minimizing joins and enabling efficient aggregations. The schema supports common analytical patterns like time-series analysis and multi-dimensional slicing without requiring complex joins across normalized tables.
 
 ### Technology Stack
 
 | Layer | Technology | Purpose |
 |-------|-----------|---------|
 | **Orchestration** | Apache Airflow | Workflow scheduling and monitoring |
+| **Cache** | Redis | Analysis result caching |
 | **Landing Zone** | MongoDB | Raw data storage (Binance, Ethereum) |
 | **Landing Zone** | PostgreSQL | Raw data storage (CoinMarketCap) |
 | **Staging** | PostgreSQL | Data cleaning and validation |
@@ -32,7 +84,7 @@ The platform follows a **medallion architecture** with 4 automated Airflow pipel
 
 ### Data Zones
 
-The platform implements a multi-layered data architecture:
+The platform implements a multi-layered architecture:
 
 #### 1. **Raw Data Files**
 - Location: `./dags/data/...` (mounted to `/opt/airflow/dags/data/...` in containers)
@@ -78,11 +130,11 @@ The platform implements a multi-layered data architecture:
   - `dw.analysis_integrated_daily`: Daily integrated metrics
 - **Plot Outputs**: PNG visualizations in `./data/analysis/...`
 
-## 🔄 Data Pipeline
+## Data Pipeline
 
 ### Pipeline Overview
 
-The platform consists of 4 automated Airflow DAGs that process data through the medallion architecture:
+Four automated Airflow DAGs process data through the medallion architecture:
 
 | Pipeline | Purpose | Trigger | Schedule | Output |
 |----------|---------|---------|----------|--------|
@@ -94,12 +146,12 @@ The platform consists of 4 automated Airflow DAGs that process data through the 
 
 ### Dataset-Based Triggering
 
-The pipelines use **Airflow Datasets** for automatic dependency management:
-- `pipeline_1_landing` → triggers → `pipeline_2_staging` (via `LANDING_DATASET`)
-- `pipeline_2_staging` → triggers → `pipeline_3_production` (via `STAGING_DATASET`)
-- `pipeline_3_production` → triggers → `pipeline_4_analytics` (via `DW_DATASET`)
+Pipelines use Airflow Datasets for dependency management:
+- `pipeline_1_landing` triggers `pipeline_2_staging` via `LANDING_DATASET`
+- `pipeline_2_staging` triggers `pipeline_3_production` via `STAGING_DATASET`
+- `pipeline_3_production` triggers `pipeline_4_analytics` via `DW_DATASET`
 
-Datasets are defined in [`dags/pipeline_datasets.py`](dags/pipeline_datasets.py).
+Dataset definitions are located in [dags/pipeline_datasets.py](dags/pipeline_datasets.py).
 
 ### Data Flow Diagram
 
@@ -227,7 +279,7 @@ erDiagram
   }
 ```
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 
@@ -239,38 +291,31 @@ erDiagram
 
 1. **Clone the repository**
 ```bash
-git clone <repository-url>
+git clone <https://github.com/Janispe/dataeng2025-blockchain-exchange>
 cd dataeng2025-blockchain-exchange
 ```
 
 2. **Configure environment variables**
 
-Create or verify the `.env` file with your configuration:
+Verify or create the `.env` file:
 ```bash
-# Copy example if needed
-cp .env.example .env
+cp .env.example .env  # if needed
 ```
 
-Key variables to set:
-- Database credentials
-- API keys (optional, for online ingestion)
-- Port configurations
+Configure database credentials, API keys (optional), and port settings.
 
 3. **Start the platform**
 ```bash
 docker compose up -d
 ```
 
-On first start, the `airflow-init` service will:
-- Initialize the Airflow metadata database
-- Create default admin user
-- Set up Airflow variables
+The `airflow-init` service initializes the Airflow metadata database, creates the default admin user, and configures Airflow variables on first startup.
 
-> **Note**: By default, `./data` ownership is not recursively changed (can be slow with large files). If you encounter permission issues, set `AIRFLOW_INIT_CHOWN_DATA=true` in `.env` and restart the init service.
+**Note**: Directory ownership for `./data` is not recursively changed by default. If permission issues occur, set `AIRFLOW_INIT_CHOWN_DATA=true` in `.env` and restart the init service.
 
 4. **Verify services**
 
-Wait 1-2 minutes for all services to start, then access:
+After 1-2 minutes, services are accessible at:
 
 | Service | URL | Credentials |
 |---------|-----|-------------|
@@ -284,75 +329,89 @@ Database connections:
 - **PostgreSQL (Data)**: `localhost:5433`
 - **MongoDB**: `localhost:27017`
 
-## 📥 Data Ingestion
+## Data Ingestion
 
 ### Option 1: Offline Mode (Sample Data)
 
-Use the included sample data for testing without API keys:
+The platform includes sample data for testing without API credentials. Sample files are located in:
+- `./dags/data/binance_klines/**/*.jsonl`
+- `./dags/data/ethereum_blocks/**/*.jsonl`
+- `./dags/data/coinmarketcap/**/*.json`
 
-1. Sample files are located in `./dags/data/`:
-   - `./dags/data/binance_klines/**/*.jsonl`
-   - `./dags/data/ethereum_blocks/**/*.jsonl`
-   - `./dags/data/coinmarketcap/**/*.json`
+The `pipeline_1_landing` DAG is enabled by default and scans these directories recursively, loading all files into the landing zone.
 
-2. Enable `pipeline_1_landing` in Airflow UI (it's enabled by default)
-
-3. The pipeline will scan all files recursively and load them into the landing zone
-
-**Partition Mode** (optional):
-- Set Airflow Variable `LANDING_ONLY_DS_PARTITION=true` to only load files from `./dags/data/<source>/<ds>/...` (where `<ds>` is the execution date)
+**Partition Mode**: Set Airflow Variable `LANDING_ONLY_DS_PARTITION=true` to restrict loading to files from `./dags/data/<source>/<ds>/...` where `<ds>` matches the execution date.
 
 ### Option 2: Online Mode (Live API Data)
 
-To fetch real-time data from APIs:
+For real-time data ingestion, configure API credentials in Airflow Variables or `.env`:
 
-1. **Set API keys** in Airflow Variables or `.env`:
-   ```bash
-   ETHERSCAN_API_KEY=your_etherscan_key
-   COINMARKETCAP_API_KEY=your_coinmarketcap_key
-   ```
+```bash
+ETHERSCAN_API_KEY=your_etherscan_key
+COINMARKETCAP_API_KEY=your_coinmarketcap_key
+```
 
-   > Binance API works without authentication for public endpoints
+Binance API public endpoints do not require authentication.
 
-2. **Configure data sources** (optional):
-   - `BINANCE_SYMBOLS`: Trading pairs to fetch (default: `BTCUSDT,ETHUSDT`)
-   - `BINANCE_INTERVAL`: Candlestick interval (default: `1m`)
-   - `BINANCE_LIMIT`: Number of candles per request (default: `1000`)
+**Configuration** (optional):
+- `BINANCE_SYMBOLS`: Trading pairs (default: `BTCUSDT,ETHUSDT`)
+- `BINANCE_INTERVAL`: Candlestick interval (default: `1m`)
+- `BINANCE_LIMIT`: Candles per request (default: `1000`)
 
-3. **Enable API ingestion**:
-   - Go to Airflow UI → DAGs
-   - Unpause `api_ingestion` DAG
-   - The DAG runs every minute and uses checkpoints to track progress
+Enable the `api_ingestion` DAG in the Airflow UI. The DAG executes every minute and maintains checkpoint state to track ingestion progress.
 
-## 📊 Analytics & Dashboard
+## Analytics & Dashboard
+
+### Research Questions
+
+The platform addresses three analytical questions:
+
+1. **Does ETH price correlate with on-chain network activity?**
+   Analyzes the relationship between off-chain market prices (Binance ETHUSDT) and on-chain gas fees (Ethereum base fee per gas). Strong correlation would suggest that price movements align with network congestion.
+
+2. **Does trading volume correlate with blockchain gas fees?**
+   Examines whether trading activity on centralized exchanges reflects on-chain network utilization. This investigates the connection between off-chain trading behavior and on-chain transaction demand.
+
+3. **How do different data sources compare for the same asset?**
+   Compares price data across CoinMarketCap and Binance, integrated with Ethereum network metrics. This validates data consistency across sources and enables multi-dimensional analysis.
+
+### Results
+
+Analysis of the January 2026 dataset reveals distinct correlation patterns:
+
+![Correlation Analysis Dashboard](./images/dashboard-correlation.png)
+
+**Price vs. Gas Fee Correlation: -0.778**
+
+A strong negative correlation indicates that ETH price movements inversely correlate with network gas fees during the analyzed period. When prices increased, gas fees tended to decrease, suggesting that price appreciation periods may coincide with reduced on-chain transaction activity.
+
+**Volume vs. Gas Fee Correlation: 0.161**
+
+Weak positive correlation between trading volume and gas fees indicates limited relationship between centralized exchange activity and on-chain network congestion. This suggests that off-chain trading behavior does not directly reflect on-chain transaction demand.
+
+**Data Source Comparison**
+
+Price data from CoinMarketCap and Binance showed consistency across the analyzed period, validating the reliability of both data sources for ETH price metrics.
 
 ### Streamlit Dashboard
 
-The Streamlit dashboard visualizes key metrics:
-- ETH price vs. gas fee correlation
-- Hourly and daily aggregations
-- Top cryptocurrencies by market cap
-
-Access at: http://localhost:8501
+The dashboard visualizes correlation coefficients, time-series trends, scatter plots, and statistical summaries. Historical correlation tracking shows how relationships evolve over time. Access the interface at http://localhost:8501.
 
 ### Analysis Pipeline
 
-`pipeline_4_analytics` generates:
-1. **Correlation analysis**: ETH price vs. network gas fees
-2. **Aggregation tables**: Daily/hourly summaries
-3. **Visualizations**: PNG plots saved to `./data/analysis/`
+The `pipeline_4_analytics` DAG produces correlation analysis between ETH price and network gas fees, daily and hourly aggregation tables, and PNG visualizations stored in `./data/analysis/`.
 
-Analysis configuration (Airflow Variables):
-- `ANALYSIS_LOOKBACK_DAYS`: Historical period to analyze
-- `ANALYSIS_ASSET_SYMBOL`: Asset to analyze (default: `ETHUSDT`)
-- `ANALYSIS_BINANCE_INTERVAL`: Interval for analysis
-- `ANALYSIS_OUTPUT_DIR`: Output directory for plots
+**Configuration** (Airflow Variables):
+- `ANALYSIS_LOOKBACK_DAYS`: Historical analysis period
+- `ANALYSIS_ASSET_SYMBOL`: Target asset (default: `ETHUSDT`)
+- `ANALYSIS_BINANCE_INTERVAL`: Analysis interval
+- `ANALYSIS_OUTPUT_DIR`: Plot output directory
 
-## ⚙️ Configuration
+## Configuration
 
 ### Key Airflow Variables
 
-The DAGs use sensible defaults matching `compose.yml`. Most commonly modified variables:
+DAGs use default values matching `compose.yml`. Commonly modified variables include:
 
 **MongoDB Configuration:**
 - `MONGO_URI`: MongoDB connection string
@@ -378,15 +437,11 @@ The DAGs use sensible defaults matching `compose.yml`. Most commonly modified va
 - `ETHERSCAN_DELETE_AFTER_LOAD`: Delete raw files after loading
 - `COINMARKETCAP_DELETE_AFTER_LOAD`: Delete raw files after loading
 
-### Environment Variables (.env)
+### Environment Variables
 
-See [`.env`](.env) for all configurable options including:
-- Service ports
-- Database credentials
-- Airflow configuration
-- API keys
+Configuration options in [.env](.env) include service ports, database credentials, Airflow settings, and API keys.
 
-## 📁 Repository Structure
+## Repository Structure
 
 ```
 .
@@ -408,12 +463,10 @@ See [`.env`](.env) for all configurable options including:
 │   └── utils.py
 ├── data/                       # Analysis outputs
 │   └── analysis/
-├── sql/                        # SQL queries and examples
-│   └── analysis_queries.sql
 └── README.md                   # This file
 ```
 
-## 🔧 Development & Troubleshooting
+## Development & Troubleshooting
 
 ### Common Issues
 
@@ -433,14 +486,7 @@ See [`.env`](.env) for all configurable options including:
 
 ### Monitoring
 
-**Airflow UI:**
-- DAG runs and task status
-- Logs for each task
-- Dataset lineage graph
-
-**Database Management:**
-- **pgAdmin**: Visual PostgreSQL management
-- **Mongo Express**: MongoDB document viewer
+The Airflow UI provides DAG execution status, task logs, and dataset lineage visualization. Database administration interfaces include pgAdmin for PostgreSQL and Mongo Express for MongoDB.
 
 ### Cleanup
 
@@ -449,13 +495,13 @@ Stop and remove all containers:
 docker compose down
 ```
 
-Remove all data (⚠️ destructive):
+Remove all data (destructive):
 ```bash
 docker compose down -v
 rm -rf ./data ./dags/data
 ```
 
-## 📚 Additional Resources
+## Additional Resources
 
 ### Data Sources
 
@@ -470,16 +516,3 @@ rm -rf ./data ./dags/data
 - **PostgreSQL**: https://www.postgresql.org/docs/
 - **Redis**: https://redis.io/docs/latest/
 - **Streamlit**: https://docs.streamlit.io/
-
-## 📄 License
-
-This project is part of an academic assignment at INSA.
-
-## 👥 Contributors
-
-- Data Engineering Course - INSA
-- Course Instructor: Prof. Riccardo Tommasini
-
----
-
-**Built with ❤️ using Apache Airflow, PostgreSQL, MongoDB, and Streamlit**
