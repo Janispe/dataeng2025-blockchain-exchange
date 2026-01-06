@@ -291,16 +291,11 @@ erDiagram
 
 1. **Clone the repository**
 ```bash
-git clone <https://github.com/Janispe/dataeng2025-blockchain-exchange>
+git clone https://github.com/Janispe/dataeng2025-blockchain-exchange
 cd dataeng2025-blockchain-exchange
 ```
 
 2. **Configure environment variables**
-
-Verify or create the `.env` file:
-```bash
-cp .env.example .env  # if needed
-```
 
 Configure database credentials, API keys (optional), and port settings.
 
@@ -328,6 +323,13 @@ Database connections:
 - **PostgreSQL (Airflow)**: `localhost:5432`
 - **PostgreSQL (Data)**: `localhost:5433`
 - **MongoDB**: `localhost:27017`
+
+### Reproducibility Notes
+
+The pipelines are connected via Airflow Datasets, so downstream DAGs trigger automatically once new data lands:
+
+- The chain only starts when at least one data source produces input (offline: sample files exist in `./dags/data/...`; online: enable `api_ingestion` or provide files).
+- `pipeline_1_landing` runs every 15 minutes by default, so allow a short delay or manually trigger it once in the Airflow UI to start the chain immediately.
 
 ## Data Ingestion
 
@@ -516,3 +518,15 @@ rm -rf ./data ./dags/data
 - **PostgreSQL**: https://www.postgresql.org/docs/
 - **Redis**: https://redis.io/docs/latest/
 - **Streamlit**: https://docs.streamlit.io/
+
+## License
+
+This project is licensed under the terms of the license in [LICENSE](LICENSE).
+
+## Contributors
+
+Repository authors / contributors (add missing team members here):
+
+- Janis Peters
+- 
+- 
